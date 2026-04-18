@@ -2,6 +2,13 @@
 #
 # Input indexing: 0 = screen, 1 = speaker.
 #
+# Applied to every YUV input at graph entry so downstream stages operate
+# in a single well-defined space. Linearize → primaries to BT.709 →
+# Hable tonemap (no-op on SDR, rolls off HDR highlights) → BT.709 matrix
+# + limited range → 8-bit yuv420p. Requires ffmpeg built with libzimg
+# (zscale) and the tonemap filter — see README Prerequisites.
+export const NORMALIZE_YUV = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=limited,format=yuv420p"
+#
 # Graph shape:
 #   [scr]           screen full-frame
 #   [cam_pip]       speaker scaled + bordered, for sliding PiP
@@ -243,8 +250,8 @@ export def build-graph [cues: list<record>, layout: record]: nothing -> record {
     let has_speaker_primary = (not ($speaker_primary_windows | is-empty))
 
     let nodes_common = [
-        $"[0:v]setpts=PTS-STARTPTS,fps=($fps),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1[scr]"
-        $"[1:v]setpts=PTS-STARTPTS,fps=($fps),scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,format=yuva420p[cam_pip]"
+        $"[0:v]setpts=PTS-STARTPTS,fps=($fps),($NORMALIZE_YUV),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1[scr]"
+        $"[1:v]setpts=PTS-STARTPTS,fps=($fps),($NORMALIZE_YUV),scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,format=yuva420p[cam_pip]"
     ]
     let n_base = ($merged_base_windows | length)
     # Fade edges only when the window abuts another cue — i.e. crossfade
@@ -259,7 +266,7 @@ export def build-graph [cues: list<record>, layout: record]: nothing -> record {
     # Much cheaper than a time-varying per-pixel alpha expression, because
     # `fade` is SIMD-optimized and each slice only handles its own window.
     let nodes_cam = if $n_base == 0 { [] } else {
-        let prep_common = $"[1:v]setpts=PTS-STARTPTS,fps=($fps),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1,format=yuva420p"
+        let prep_common = $"[1:v]setpts=PTS-STARTPTS,fps=($fps),($NORMALIZE_YUV),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1,format=yuva420p"
         let prep_node = if $n_base == 1 {
             $"($prep_common)[cam_src_0]"
         } else {
@@ -279,7 +286,7 @@ export def build-graph [cues: list<record>, layout: record]: nothing -> record {
         [$prep_node] ++ $fade_nodes
     }
     let nodes_scr_pip = if $has_speaker_primary {
-        [ $"[0:v]setpts=PTS-STARTPTS,fps=($fps),scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,format=yuva420p[scr_pip]" ]
+        [ $"[0:v]setpts=PTS-STARTPTS,fps=($fps),($NORMALIZE_YUV),scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,format=yuva420p[scr_pip]" ]
     } else {
         []
     }

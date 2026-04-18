@@ -59,6 +59,7 @@ def main [cue_path: string] {
         "-map" "[vout]" "-map" "[aout]"
         "-c:v" "libx264" "-preset" "medium" "-crf" "20"
         "-pix_fmt" "yuv420p"
+        "-colorspace" "bt709" "-color_primaries" "bt709" "-color_trc" "bt709" "-color_range" "tv"
         "-c:a" "aac" "-ar" "48000" "-ac" "2" "-b:a" "192k"
         "-movflags" "+faststart"
         "output/final.mp4"

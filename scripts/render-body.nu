@@ -80,11 +80,12 @@ def main [cue_path: string] {
             "-y"
             "-i" $speaker
             ...$audio.inputs
-            "-vf" $"fps=($fps),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1,format=yuv420p"
+            "-vf" $"fps=($fps),($NORMALIZE_YUV),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1"
             "-map" "0:v"
             "-map" $audio.map
             "-c:v" "libx264" "-preset" "medium" "-crf" "20"
             "-pix_fmt" "yuv420p"
+            "-colorspace" "bt709" "-color_primaries" "bt709" "-color_trc" "bt709" "-color_range" "tv"
             "-c:a" "aac" "-ar" "48000" "-ac" "2" "-b:a" "192k"
             "-r" $fps_s
             "-shortest"
@@ -142,6 +143,7 @@ def main [cue_path: string] {
         "-map" $audio.map
         "-c:v" "libx264" "-preset" "medium" "-crf" "20"
         "-pix_fmt" "yuv420p"
+        "-colorspace" "bt709" "-color_primaries" "bt709" "-color_trc" "bt709" "-color_range" "tv"
         "-c:a" "aac" "-ar" "48000" "-ac" "2" "-b:a" "192k"
         "-r" $fps_s
         "-shortest"

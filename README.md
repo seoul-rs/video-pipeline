@@ -13,7 +13,7 @@ Install these first via your package manager of choice.
 
 - [`just`](https://just.systems): recipe runner; like make, but fewer footguns and written in Rust
 - [`nushell`](https://nushell.sh): shell scripting, with superpowers and fewer footguns; also written in Rust
-- [`ffmpeg`](https://ffmpeg.org) — rendering and compositing
+- [`ffmpeg`](https://ffmpeg.org) — rendering and compositing. **On macOS, install Homebrew's `ffmpeg-full`** (`brew install ffmpeg-full`), not the regular `ffmpeg`. The pipeline needs the `zscale` (libzimg) and `tonemap` filters for HDR→SDR conversion, which are only bundled in `ffmpeg-full`. On Linux/BSD, check that your distro's ffmpeg was built with libzimg.
 - [`resvg`](https://github.com/linebender/resvg): SVG rendering to PNG (intro and outro cards); also Rust
 
 ## Quick start
