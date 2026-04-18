@@ -19,7 +19,7 @@ outro:
 
 # Concat intro + body + outro into output/final.mp4
 concat:
-    nu scripts/concat.nu
+    nu scripts/concat.nu {{cue}}
 
 # Wipe intermediates and final output
 clean:

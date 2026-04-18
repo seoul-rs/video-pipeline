@@ -42,6 +42,9 @@ pip_margin = 40
 # Duration (seconds) for PiP slide-in/out and for the base-layer crossfade
 # at transitions between screen-primary/screen-only and speaker-primary/speaker-only.
 transition_duration = 0.5
+# Duration (seconds) of the crossfade between intro, body, and outro segments.
+# Set to 0 for a hard cut (fast path: stream copy, no re-encode).
+xfade_duration = 0.5
 
 # Time ranges are "HH:MM:SS" (or "MM:SS").
 # Modes:
