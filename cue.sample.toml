@@ -39,19 +39,20 @@ resolution = [1920, 1080]
 fps = 30
 pip_size = [480, 270]
 pip_margin = 40
-slide_dur = 0.5
+# Duration (seconds) for PiP slide-in/out and for the base-layer crossfade
+# at transitions between screen-primary/screen-only and speaker-primary/speaker-only.
+transition_duration = 0.5
 
 # Time ranges are "HH:MM:SS" (or "MM:SS").
 # Modes:
-#   pip    - screen full frame, speaker as PiP in the corner
-#   hidden - screen full frame, speaker parked off-canvas
-#   swap   - speaker full frame, screen as PiP
-#   solo   - speaker full frame only, no PiP
+#   screen-primary  - screen full frame; speaker as PiP
+#   screen-only     - screen full frame; no speaker video
+#   speaker-primary - speaker full frame; screen as PiP
+#   speaker-only    - speaker full frame only; no screen
 #
-# `pip` and `swap` cues take an optional `corner` field.
-# The PiP slides
-# in horizontally from the nearest edge and rests there.
-# Valid values:
+# `screen-primary` and `speaker-primary` cues take an optional `corner`
+# field. The PiP slides in horizontally from the nearest edge and rests
+# there. Valid values:
 #   bottom-right (default)
 #   top-right
 #   top-left
@@ -59,27 +60,27 @@ slide_dur = 0.5
 #
 # Cues are ignored when `sources.screen` is unset.
 [[cues]]
-mode = "solo"
+mode = "speaker-only"
 from = "00:00:00"
 to   = "00:05:30"
 
 [[cues]]
-mode = "hidden"
+mode = "screen-only"
 from = "00:05:30"
 to   = "00:06:45"
 
 [[cues]]
-mode = "pip"
+mode = "screen-primary"
 from = "00:06:45"
 to   = "00:38:00"
 
 [[cues]]
-mode = "swap"
+mode = "speaker-primary"
 from   = "00:38:00"
 to     = "00:45:00"
 corner = "top-right"  # optional corner specification
 
 [[cues]]
-mode = "solo"
+mode = "speaker-only"
 from = "00:45:00"
 to   = "00:47:31"

@@ -3,19 +3,24 @@
 # Input indexing: 0 = screen, 1 = speaker.
 #
 # Graph shape:
-#   [scr]       screen full-frame
-#   [cam]       speaker full-frame (used during swap + solo modes)
-#   [cam_pip]   speaker scaled + bordered, for sliding PiP
-#   [scr_pip]   screen scaled + bordered, for sliding PiP in swap mode
+#   [scr]           screen full-frame
+#   [cam_pip]       speaker scaled + bordered, for sliding PiP
+#   [scr_pip]       screen scaled + bordered, for sliding PiP in speaker-primary mode
+#   [cam_i]         speaker full-frame, one per merged speaker-primary/only
+#                   window, trimmed to that window and alpha-faded at the edges
+#                   with `fade` — gives the base a crossfade instead of a cut
 #
-#   [scr][cam_pip]  overlay with multi-corner x/y exprs (pip cues)   -> [v1]
-#   [v1][cam]       overlay 0:0 with enable=(swap+solo cues)          -> [v2]   (if any swap/solo)
-#   [v2][scr_pip]   overlay with multi-corner x/y exprs (swap cues)   -> [vout] (if any swap)
+#   [scr][cam_pip]      overlay, x/y exprs covering all screen-primary corners  -> [v1]
+#   [v1][cam_0]         overlay 0:0, enable gated on merged window 0            -> [vbase_0]
+#   [vbase_0][cam_1]    overlay 0:0, enable gated on merged window 1            -> [vbase_1]
+#   ...                                                                         -> [vbase_{N-1}]
+#   [vbase_{N-1}][scr_pip] overlay for speaker-primary corners                  -> [vout]
+#                          (omitted if no speaker-primary cue)
 #
 # Cues may declare an optional `corner` field (default "bottom-right").
 # Valid: bottom-right, top-right, top-left, bottom-left. The PiP slides
 # in horizontally from the nearest canvas edge and rests at the chosen
-# corner. Only applies to `pip` and `swap` cues.
+# corner. Only applies to `screen-primary` and `speaker-primary` cues.
 
 export def parse-hms [s: string]: nothing -> float {
     let parts = ($s | split row ":" | each { into float })
@@ -83,7 +88,7 @@ def signed-term [k: int, expr: string]: nothing -> string {
 # env_sum_c     = Σ envelope(t1, t2) over cues in corner c (smooth ramp)
 export def axis-expr [
     groups: list<record>
-    slide_dur: float
+    transition: float
     default_off: int
 ]: nothing -> string {
     let terms = ($groups | each { |g|
@@ -91,7 +96,7 @@ export def axis-expr [
             ""
         } else {
             let between_sum = ($g.windows | each { |w| $"between\(t,($w.0),($w.1))" } | str join "+")
-            let env_sum = ($g.windows | each { |w| envelope $w.0 $w.1 $slide_dur } | str join "+")
+            let env_sum = ($g.windows | each { |w| envelope $w.0 $w.1 $transition } | str join "+")
             let off_shift = ($g.off - $default_off)
             let rest_shift = ($g.rest - $g.off)
             let t_step = (signed-term $off_shift $between_sum)
@@ -107,12 +112,26 @@ export def axis-expr [
     }
 }
 
-# enable= expression for hard-cut overlay (full-frame camera during
-# swap + solo windows).
-def windows-enable-expr [windows: list<list<float>>]: nothing -> string {
+# Fuse exactly-adjacent windows (next.t1 == curr.t2). Input windows are
+# assumed non-overlapping; adjacency comes from contiguous cues. Used to
+# coalesce speaker-primary + speaker-only windows that drive the base-layer
+# alpha/enable so the cam layer stays opaque across the seam rather than
+# dipping to transparent.
+def merge-windows [windows: list<list<float>>]: nothing -> list<list<float>> {
     $windows
-    | each { |w| $"between\(t,($w.0),($w.1))" }
-    | str join "+"
+    | sort-by { |w| $w.0 }
+    | reduce --fold [] { |w, acc|
+        if ($acc | is-empty) {
+            [$w]
+        } else {
+            let last = ($acc | last)
+            if $w.0 == $last.1 {
+                ($acc | drop 1 | append [[$last.0, $w.1]])
+            } else {
+                ($acc | append [$w])
+            }
+        }
+    }
 }
 
 # Build the complete filter_complex string.
@@ -123,7 +142,7 @@ export def build-graph [cues: list<record>, layout: record]: nothing -> record {
     let pip_w = ($layout.pip_size | get 0)
     let pip_h = ($layout.pip_size | get 1)
     let margin = $layout.pip_margin
-    let slide = ($layout.slide_dur | into float)
+    let transition = ($layout.transition_duration | into float)
     let fps = $layout.fps
 
     let border = 2
@@ -137,7 +156,7 @@ export def build-graph [cues: list<record>, layout: record]: nothing -> record {
     let cs = ($cues | each { |c|
         let mode = $c.mode
         let corner = ($c.corner? | default "bottom-right")
-        if ($mode in ["pip" "swap"]) and ($corner not-in $valid_corners) {
+        if ($mode in ["screen-primary" "speaker-primary"]) and ($corner not-in $valid_corners) {
             error make { msg: $"cue corner '($corner)' is invalid. valid: ($valid_corners | str join ', ')" }
         }
         {
@@ -148,69 +167,101 @@ export def build-graph [cues: list<record>, layout: record]: nothing -> record {
         }
     })
 
-    # Build per-mode, per-corner groups. The same windows drive both x
+    # Per-mode, per-corner groups. The same windows drive both x
     # (which slides) and y (which steps between top and bottom).
-    let pip_x_groups = ($valid_corners | each { |c|
-        let windows = ($cs | where mode == "pip" and corner == $c | each { |x| [$x.t1, $x.t2] })
+    let screen_primary_x_groups = ($valid_corners | each { |c|
+        let windows = ($cs | where mode == "screen-primary" and corner == $c | each { |x| [$x.t1, $x.t2] })
         let spec = (corner-spec $c $w $h $pip_w $pph $ppw $margin)
         { windows: $windows, off: $spec.off_x, rest: $spec.rest_x }
     })
-    let pip_y_groups = ($valid_corners | each { |c|
-        let windows = ($cs | where mode == "pip" and corner == $c | each { |x| [$x.t1, $x.t2] })
+    let screen_primary_y_groups = ($valid_corners | each { |c|
+        let windows = ($cs | where mode == "screen-primary" and corner == $c | each { |x| [$x.t1, $x.t2] })
         let spec = (corner-spec $c $w $h $pip_w $pph $ppw $margin)
         { windows: $windows, off: $spec.y, rest: $spec.y }
     })
-    let swap_x_groups = ($valid_corners | each { |c|
-        let windows = ($cs | where mode == "swap" and corner == $c | each { |x| [$x.t1, $x.t2] })
+    let speaker_primary_x_groups = ($valid_corners | each { |c|
+        let windows = ($cs | where mode == "speaker-primary" and corner == $c | each { |x| [$x.t1, $x.t2] })
         let spec = (corner-spec $c $w $h $pip_w $pph $ppw $margin)
         { windows: $windows, off: $spec.off_x, rest: $spec.rest_x }
     })
-    let swap_y_groups = ($valid_corners | each { |c|
-        let windows = ($cs | where mode == "swap" and corner == $c | each { |x| [$x.t1, $x.t2] })
+    let speaker_primary_y_groups = ($valid_corners | each { |c|
+        let windows = ($cs | where mode == "speaker-primary" and corner == $c | each { |x| [$x.t1, $x.t2] })
         let spec = (corner-spec $c $w $h $pip_w $pph $ppw $margin)
         { windows: $windows, off: $spec.y, rest: $spec.y }
     })
 
-    let pip_x = (axis-expr $pip_x_groups $slide $default_off_x)
-    let pip_y = (axis-expr $pip_y_groups $slide $default_y)
-    let swap_x = (axis-expr $swap_x_groups $slide $default_off_x)
-    let swap_y = (axis-expr $swap_y_groups $slide $default_y)
+    let screen_primary_x = (axis-expr $screen_primary_x_groups $transition $default_off_x)
+    let screen_primary_y = (axis-expr $screen_primary_y_groups $transition $default_y)
+    let speaker_primary_x = (axis-expr $speaker_primary_x_groups $transition $default_off_x)
+    let speaker_primary_y = (axis-expr $speaker_primary_y_groups $transition $default_y)
 
-    let swap_windows_all = ($cs | where mode == "swap" | each { |w| [$w.t1, $w.t2] })
-    let solo_windows = ($cs | where mode == "solo" | each { |w| [$w.t1, $w.t2] })
-    let cam_full_windows = ($swap_windows_all ++ $solo_windows)
-    let has_swap = (not ($swap_windows_all | is-empty))
+    let speaker_primary_windows = ($cs | where mode == "speaker-primary" | each { |w| [$w.t1, $w.t2] })
+    let speaker_only_windows = ($cs | where mode == "speaker-only" | each { |w| [$w.t1, $w.t2] })
+    let merged_base_windows = (merge-windows ($speaker_primary_windows ++ $speaker_only_windows))
+    let has_speaker_primary = (not ($speaker_primary_windows | is-empty))
 
     let nodes_common = [
         $"[0:v]setpts=PTS-STARTPTS,fps=($fps),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1[scr]"
         $"[1:v]setpts=PTS-STARTPTS,fps=($fps),scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,format=yuva420p[cam_pip]"
     ]
-    let nodes_cam = if ($cam_full_windows | is-empty) { [] } else {
-        [ $"[1:v]setpts=PTS-STARTPTS,fps=($fps),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1[cam]" ]
+    let n_base = ($merged_base_windows | length)
+    # Fade edges only when the window abuts another cue — i.e. crossfade
+    # from/to the screen base. If nothing precedes (e.g. the first cue starts
+    # at t=0) or nothing follows (e.g. the last cue ends at video end), a fade
+    # would reveal the screen underneath and look wrong. Hard-cut in that case.
+    let cue_froms = ($cs | each { |c| $c.t1 })
+    let cue_tos = ($cs | each { |c| $c.t2 })
+    # Per-merged-window cam instances: prep once, split N times, then
+    # trim+fade each slice independently. `trim` bounds the frames a
+    # downstream overlay will pull, `fade` shapes alpha at the edges.
+    # Much cheaper than a time-varying per-pixel alpha expression, because
+    # `fade` is SIMD-optimized and each slice only handles its own window.
+    let nodes_cam = if $n_base == 0 { [] } else {
+        let prep_common = $"[1:v]setpts=PTS-STARTPTS,fps=($fps),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1,format=yuva420p"
+        let prep_node = if $n_base == 1 {
+            $"($prep_common)[cam_src_0]"
+        } else {
+            let outs = (0..($n_base - 1) | each { |i| $"[cam_src_($i)]" } | str join "")
+            $"($prep_common),split=($n_base)($outs)"
+        }
+        let fade_nodes = ($merged_base_windows | enumerate | each { |it|
+            let i = $it.index
+            let w_ = $it.item
+            let needs_fade_in = ($w_.0 in $cue_tos)
+            let needs_fade_out = ($w_.1 in $cue_froms)
+            let fade_in = if $needs_fade_in { $",fade=t=in:st=($w_.0):d=($transition):alpha=1" } else { "" }
+            let fade_out_st = ($w_.1 - $transition)
+            let fade_out = if $needs_fade_out { $",fade=t=out:st=($fade_out_st):d=($transition):alpha=1" } else { "" }
+            $"[cam_src_($i)]trim=start=($w_.0):end=($w_.1)($fade_in)($fade_out)[cam_($i)]"
+        })
+        [$prep_node] ++ $fade_nodes
     }
-    let nodes_scr_pip = if $has_swap {
+    let nodes_scr_pip = if $has_speaker_primary {
         [ $"[0:v]setpts=PTS-STARTPTS,fps=($fps),scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,format=yuva420p[scr_pip]" ]
     } else {
         []
     }
 
-    let overlay_pip = $"[scr][cam_pip]overlay=x='($pip_x)':y='($pip_y)':eof_action=pass[v1]"
+    let overlay_base = $"[scr][cam_pip]overlay=x='($screen_primary_x)':y='($screen_primary_y)':eof_action=pass[v1]"
 
-    let overlays = if ($cam_full_windows | is-empty) {
-        [ ($overlay_pip | str replace --all "[v1]" "[vout]") ]
-    } else if (not $has_swap) {
-        let enable = (windows-enable-expr $cam_full_windows)
-        [
-            $overlay_pip
-            $"[v1][cam]overlay=0:0:enable='($enable)':eof_action=pass[vout]"
-        ]
+    let overlays = if $n_base == 0 {
+        [ ($overlay_base | str replace --all "[v1]" "[vout]") ]
     } else {
-        let enable = (windows-enable-expr $cam_full_windows)
-        [
-            $overlay_pip
-            $"[v1][cam]overlay=0:0:enable='($enable)':eof_action=pass[v2]"
-            $"[v2][scr_pip]overlay=x='($swap_x)':y='($swap_y)':eof_action=pass[vout]"
-        ]
+        let cam_overlays = ($merged_base_windows | enumerate | each { |it|
+            let i = $it.index
+            let w_ = $it.item
+            let prev = if $i == 0 { "v1" } else { let p = ($i - 1); $"vbase_($p)" }
+            let is_last = ($i == ($n_base - 1))
+            let next = if $is_last and (not $has_speaker_primary) { "vout" } else { $"vbase_($i)" }
+            $"[($prev)][cam_($i)]overlay=0:0:enable='between\(t,($w_.0),($w_.1))':eof_action=pass[($next)]"
+        })
+        let chain = [$overlay_base] ++ $cam_overlays
+        if $has_speaker_primary {
+            let last_idx = ($n_base - 1)
+            $chain ++ [ $"[vbase_($last_idx)][scr_pip]overlay=x='($speaker_primary_x)':y='($speaker_primary_y)':eof_action=pass[vout]" ]
+        } else {
+            $chain
+        }
     }
 
     let graph = ($nodes_common ++ $nodes_cam ++ $nodes_scr_pip ++ $overlays | str join ";")

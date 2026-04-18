@@ -43,25 +43,31 @@ def main [cue_path: string] {
     print "rasterizing with resvg"
     ^resvg -w ($w | into string) -h ($h | into string) work/intro.svg work/intro.png
 
-    let audio_file = "assets/intro.wav"
-    let audio_args = if ($audio_file | path exists) {
-        print $"muxing with ($audio_file)"
-        ["-i" $audio_file]
+    # We bound the video loop with `-t $dur` rather than using `-shortest`.
+    # `-shortest` with `-loop 1 -i still.png` overshoots video by ~1-2s,
+    # giving tracks of mismatched durations. The concat demuxer then plays
+    # each track independently and the next segment's audio starts while
+    # this segment's video is still on screen. Explicit `-t` keeps them even.
+    let audio_plan = if ("assets/intro.wav" | path exists) {
+        let dur = (^ffprobe -v error -show_entries format=duration -of csv=p=0 "assets/intro.wav"
+            | complete | get stdout | str trim | into float)
+        print "muxing with assets/intro.wav"
+        { args: ["-i" "assets/intro.wav"], dur: $dur }
     } else {
         print "no assets/intro.wav found - using 3s of silence"
-        ["-f" "lavfi" "-t" "3" "-i" "anullsrc=r=48000:cl=stereo"]
+        { args: ["-f" "lavfi" "-i" "anullsrc=r=48000:cl=stereo"], dur: 3.0 }
     }
 
     let args = [
         "-y"
-        "-loop" "1" "-i" "work/intro.png"
-        ...$audio_args
+        "-loop" "1" "-t" ($audio_plan.dur | into string) "-i" "work/intro.png"
+        ...$audio_plan.args
         "-vf" $"fps=($fps),scale=($w):($h),setsar=1,format=yuv420p"
         "-c:v" "libx264" "-tune" "stillimage" "-preset" "medium" "-crf" "20"
         "-pix_fmt" "yuv420p"
         "-c:a" "aac" "-ar" "48000" "-ac" "2" "-b:a" "192k"
         "-r" ($fps | into string)
-        "-shortest"
+        "-t" ($audio_plan.dur | into string)
         "-movflags" "+faststart"
         "work/intro.mp4"
     ]
