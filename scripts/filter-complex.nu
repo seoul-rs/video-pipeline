@@ -17,10 +17,14 @@
 #   [vbase_{N-1}][scr_pip] overlay for speaker-primary corners                  -> [vout]
 #                          (omitted if no speaker-primary cue)
 #
-# Cues may declare an optional `corner` field (default "bottom-right").
-# Valid: bottom-right, top-right, top-left, bottom-left. The PiP slides
-# in horizontally from the nearest canvas edge and rests at the chosen
-# corner. Only applies to `screen-primary` and `speaker-primary` cues.
+# Cues declare only `until` (end timestamp); `from` is implicit — 0 for the
+# first cue, the previous cue's `until` for every subsequent cue. The magic
+# value `until = "end"` resolves to the speaker video's duration (passed in
+# from the caller). Cues may declare an optional `corner` field (default
+# "bottom-right"). Valid: bottom-right, top-right, top-left, bottom-left.
+# The PiP slides in horizontally from the nearest canvas edge and rests at
+# the chosen corner. Only applies to `screen-primary` and `speaker-primary`
+# cues.
 
 export def parse-hms [s: string]: nothing -> float {
     let parts = ($s | split row ":" | each { into float })
@@ -30,6 +34,44 @@ export def parse-hms [s: string]: nothing -> float {
         1 => $parts.0
         _ => (error make { msg: $"invalid HH:MM:SS string: ($s)" })
     }
+}
+
+# Expand `[[cues]]` with `until` into the internal { mode, corner?, from, to }
+# form, with `from`/`to` as floats (seconds). Resolves the implicit `from`
+# (0 for cue 0, previous cue's resolved `until` thereafter) and the magic
+# value `until = "end"` → `video_duration`. Enforces:
+#   - monotonicity: each `until` strictly greater than the running `from`
+#   - `"end"` only on the last cue
+export def normalize-cues [
+    cues: list<record>
+    video_duration: float
+]: nothing -> list<record> {
+    let n = ($cues | length)
+    $cues | enumerate | reduce --fold { out: [], cursor: 0.0 } { |it, acc|
+        let i = $it.index
+        let c = $it.item
+        let is_last = ($i == ($n - 1))
+        let until_raw = $c.until
+        let to = if $until_raw == "end" {
+            if not $is_last {
+                error make { msg: $"cue ($i): `until = \"end\"` is only valid on the last cue" }
+            }
+            $video_duration
+        } else {
+            parse-hms $until_raw
+        }
+        if $to <= $acc.cursor {
+            error make { msg: $"cue ($i): `until` \(($to)s) must be strictly greater than the cue's start \(($acc.cursor)s)" }
+        }
+        let rec = {
+            mode: $c.mode
+            corner: ($c.corner? | default "bottom-right")
+            from: $acc.cursor
+            to: $to
+        }
+        { out: ($acc.out | append $rec), cursor: $to }
+    }
+    | get out
 }
 
 # Sine envelope that ramps 0 -> 1 over [t1, t1+d] and 1 -> 0 over [t2-d, t2].
@@ -162,8 +204,8 @@ export def build-graph [cues: list<record>, layout: record]: nothing -> record {
         {
             mode: $mode
             corner: $corner
-            t1: (parse-hms $c.from)
-            t2: (parse-hms $c.to)
+            t1: $c.from
+            t2: $c.to
         }
     })
 

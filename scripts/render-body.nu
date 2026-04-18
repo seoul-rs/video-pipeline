@@ -14,6 +14,14 @@ def has-audio-stream [path: string]: nothing -> bool {
     not ($r.stdout | str trim | is-empty)
 }
 
+def probe-duration [path: string]: nothing -> float {
+    ^ffprobe -v error -show_entries format=duration -of csv=p=0 $path
+    | complete
+    | get stdout
+    | str trim
+    | into float
+}
+
 # ffmpeg input args + audio map given a resolved audio plan.
 # plan.kind: "file" | "stream" | "silence"
 # plan.path: path for file kind
@@ -102,7 +110,12 @@ def main [cue_path: string] {
     let screen_pre = if $offset < 0.0 { ["-ss" (($offset * -1.0) | into string)] } else { [] }
     let speaker_pre = if $offset > 0.0 { ["-ss" ($offset | into string)] } else { [] }
 
-    let g = (build-graph $cues $layout)
+    # Speaker duration after the head-trim; this is what `until = "end"`
+    # resolves to, matching the effective body timeline (t=0 post-seek).
+    let speaker_dur = (probe-duration $speaker) - (if $offset > 0.0 { $offset } else { 0.0 })
+    let normalized = (normalize-cues $cues $speaker_dur)
+
+    let g = (build-graph $normalized $layout)
 
     let audio_plan = if $audio_override != null {
         { kind: "file", path: $audio_override }

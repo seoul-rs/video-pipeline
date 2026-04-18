@@ -46,7 +46,15 @@ transition_duration = 0.5
 # Set to 0 for a hard cut (fast path: stream copy, no re-encode).
 xfade_duration = 0.5
 
-# Time ranges are "HH:MM:SS" (or "MM:SS").
+# Each cue declares only `until` — the end of its window. The start is
+# implicit: 0 for the first cue, the previous cue's `until` for every
+# subsequent cue. Cues must be listed in timeline order, and each `until`
+# must be strictly greater than the cue's (implicit) start.
+#
+# `until` accepts "HH:MM:SS", "MM:SS", bare seconds, or the magic value
+# "end" (only valid on the last cue), which resolves to the speaker
+# video's duration.
+#
 # Modes:
 #   screen-primary  - screen full frame; speaker as PiP
 #   screen-only     - screen full frame; no speaker video
@@ -63,27 +71,22 @@ xfade_duration = 0.5
 #
 # Cues are ignored when `sources.screen` is unset.
 [[cues]]
-mode = "speaker-only"
-from = "00:00:00"
-to   = "00:05:30"
+mode  = "speaker-only"
+until = "00:05:30"
 
 [[cues]]
-mode = "screen-only"
-from = "00:05:30"
-to   = "00:06:45"
+mode  = "screen-only"
+until = "00:06:45"
 
 [[cues]]
-mode = "screen-primary"
-from = "00:06:45"
-to   = "00:38:00"
+mode  = "screen-primary"
+until = "00:38:00"
 
 [[cues]]
-mode = "speaker-primary"
-from   = "00:38:00"
-to     = "00:45:00"
+mode   = "speaker-primary"
+until  = "00:45:00"
 corner = "top-right"  # optional corner specification
 
 [[cues]]
-mode = "speaker-only"
-from = "00:45:00"
-to   = "00:47:31"
+mode  = "speaker-only"
+until = "end"
