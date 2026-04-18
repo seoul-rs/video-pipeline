@@ -4,22 +4,35 @@
 # (or silence if the file is absent) using ffmpeg.
 #
 # Writes output to work/intro.mp4.
-#
-# Title layout: these mirror the <text> element in assets/intro.svg
-# (x=960, y=500, font-size=96). Line height is 1.2em = 115.2px.
-const TITLE_X = 960
-const TITLE_CENTER_Y = 500
-const TITLE_LINE_HEIGHT = 115.2
 
-# Build one <tspan> per line, vertically centered around TITLE_CENTER_Y.
-def title-tspans [title: string]: nothing -> string {
-    let lines = ($title | split row "\n" | each { str trim } | where {|l| $l != "" })
+const TITLE_X = 960
+
+# Per-line-count layout: font size, line height (1.2em), the vertical center
+# of the title block, and the y coords for speaker and date beneath it.
+# n=1/2 preserve the original look; n>=3 shrinks the title and shifts
+# speaker/date down to clear the taller block.
+def layout-for [n: int]: nothing -> record {
+    if $n <= 2 {
+        { font_size: 96, line_height: 115.2, title_center_y: 500, speaker_y: 640, date_y: 900 }
+    } else if $n == 3 {
+        { font_size: 78, line_height: 93.6, title_center_y: 480, speaker_y: 700, date_y: 920 }
+    } else {
+        { font_size: 66, line_height: 79.2, title_center_y: 460, speaker_y: 720, date_y: 930 }
+    }
+}
+
+def title-lines [title: string]: nothing -> list<string> {
+    $title | split row "\n" | each { str trim } | where {|l| $l != "" }
+}
+
+# Build one <tspan> per line, vertically centered around layout.title_center_y.
+def title-tspans [lines: list<string>, layout: record]: nothing -> string {
     let n = ($lines | length)
-    let top_y = $TITLE_CENTER_Y - ($n - 1) * $TITLE_LINE_HEIGHT / 2
+    let top_y = $layout.title_center_y - ($n - 1) * $layout.line_height / 2
     $lines
     | enumerate
     | each {|it|
-        let y = $top_y + $it.index * $TITLE_LINE_HEIGHT
+        let y = $top_y + $it.index * $layout.line_height
         $'<tspan x="($TITLE_X)" y="($y)">($it.item)</tspan>'
     }
     | str join "\n    "
@@ -33,9 +46,16 @@ def main [cue_path: string] {
 
     mkdir work
 
-    print "rendering intro card SVG"
+    let lines = (title-lines $cue.title)
+    let n = ($lines | length)
+    let layout = (layout-for $n)
+    print $"rendering intro card SVG \(($n)-line title at ($layout.font_size)pt\)"
+
     open --raw assets/intro.svg
-    | str replace --all "{{TITLE}}" (title-tspans $cue.title)
+    | str replace --all "{{TITLE}}" (title-tspans $lines $layout)
+    | str replace --all "{{TITLE_FONT_SIZE}}" ($layout.font_size | into string)
+    | str replace --all "{{SPEAKER_Y}}" ($layout.speaker_y | into string)
+    | str replace --all "{{DATE_Y}}" ($layout.date_y | into string)
     | str replace --all "{{SPEAKER}}" $cue.speaker
     | str replace --all "{{DATE}}" $cue.date
     | save -f work/intro.svg

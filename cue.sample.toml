@@ -1,7 +1,13 @@
 # Copy to cue.toml and edit. cue.toml is gitignored.
 
-# The intro generator can't wrap text automatically,
-# so we use multi-line strings.
+# The intro generator can't wrap text automatically, so we use
+# multi-line strings. Up to 4 lines are supported: 1-2 lines render
+# at the default 96pt; 3 lines shrink to 78pt and 4 lines to 66pt,
+# with the speaker/date rows shifting down to make room.
+#
+# The script only reacts to line count, not per-line length - if a
+# single line is still too wide to fit horizontally, split it across
+# more lines rather than relying on the adaptive font-size.
 title = """
 Zia: A Programming Language that
 Defines Itself
