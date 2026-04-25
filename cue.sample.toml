@@ -19,9 +19,9 @@ date = "2026-01-08"
 # Speaker video is always required.
 speaker = "recordings/speaker.mp4"
 
-# Optional. When absent, the body is just the rescaled speaker video;
-# no PiP and cues are skipped. Any audio on the screen is ignored when
-# the speaker video has its own.
+# Optional. When omitted and cues are empty, the body is just the
+# rescaled speaker video. When omitted but cues are present, every
+# non-speaker-only cue must supply its own `image` (see below).
 screen = "recordings/screen.mp4"
 
 # Optional. Overrides the default body-audio source. When unset:
@@ -37,7 +37,7 @@ screen = "recordings/screen.mp4"
 #   NEGATIVE - screen is BEHIND speaker (events on screen lag the
 #              narration; screen started first)
 # Magnitude = drift in seconds. Omit or 0 if aligned.
-# Ignored when there is no screen recording.
+# Must be 0 (or omitted) when sources.screen is not set.
 screen_offset = 0.0
 
 [layout]
@@ -75,7 +75,14 @@ xfade_duration = 0.5
 #   top-left
 #   bottom-left
 #
-# Cues are ignored when `sources.screen` is unset.
+# Any cue that uses the screen role (every mode except `speaker-only`)
+# may supply an optional `image` field — a still image that replaces
+# the screen source for that cue's window. The image fills the canvas
+# in screen-primary/screen-only modes and fills the PiP in
+# speaker-primary mode. When `sources.screen` is set, `image` overrides
+# the screen video just for that window. When `sources.screen` is unset,
+# every non-speaker-only cue must have an `image`. `image` on a
+# speaker-only cue is an error.
 [[cues]]
 mode  = "speaker-only"
 until = "00:05:30"
@@ -83,6 +90,7 @@ until = "00:05:30"
 [[cues]]
 mode  = "screen-only"
 until = "00:06:45"
+image = "slides/intro.png"  # optional; replaces screen for this window
 
 [[cues]]
 mode  = "screen-primary"

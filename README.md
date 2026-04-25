@@ -41,9 +41,15 @@ Drop your talk recordings somewhere the cue file can point at them
 (`recordings/` is gitignored and conventional):
 
 - **Speaker video** (required). Video + audio.
-- **Screen recording** (optional). If omitted, the body is just a
-  rescaled speaker video; cues are ignored. Any audio on the screen
-  is ignored when the speaker video has its own.
+- **Screen recording** (optional). If omitted with no cues, the body
+  is just the rescaled speaker video. If omitted with cues present,
+  every non-speaker-only cue must supply an `image` (see cue
+  reference). Any audio on the screen is ignored when the speaker
+  video has its own.
+- **Still images** (optional). Any cue that uses the screen role may
+  declare `image = "path.png"` to show a still image in place of the
+  screen feed for that window. Works with or without a screen
+  recording.
 - **Separate audio track** (optional). Set `sources.audio` in the cue
   file to override the default audio source.
 

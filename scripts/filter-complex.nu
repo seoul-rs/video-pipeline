@@ -8,6 +8,14 @@
 # + limited range → 8-bit yuv420p. Requires ffmpeg built with libzimg
 # (zscale) and the tonemap filter — see README Prerequisites.
 export const NORMALIZE_YUV = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=limited,format=yuv420p"
+# Color-space conversion for sRGB still images. `format=gbrp` forces a
+# known planar RGB pix_fmt before zscale — without it, the preceding
+# scale filter in a filter_complex graph can negotiate `gbr`-tagged RGB
+# that zscale rejects with "no path between colorspaces". zscale then
+# applies sRGB transfer → BT.709 transfer and converts to BT.709-matrix
+# limited-range YUV. Caller appends `format=yuv420p` or `format=yuva420p`
+# depending on whether an alpha channel is needed downstream.
+export const NORMALIZE_SRGB = "format=gbrp,zscale=tin=iec61966-2-1:pin=bt709:t=bt709:p=bt709:m=bt709:r=tv"
 #
 # Graph shape:
 #   [scr]           screen full-frame
@@ -70,11 +78,21 @@ export def normalize-cues [
         if $to <= $acc.cursor {
             error make { msg: $"cue ($i): `until` \(($to)s) must be strictly greater than the cue's start \(($acc.cursor)s)" }
         }
+        let image = (if ($c.image? | is-empty) { null } else { $c.image | path expand })
+        if ($image != null) {
+            if $c.mode == "speaker-only" {
+                error make { msg: $"cue ($i): `image` is not valid on `speaker-only` cues \(the image would have nowhere to appear)" }
+            }
+            if not ($image | path exists) {
+                error make { msg: $"cue ($i): image file not found: ($image)" }
+            }
+        }
         let rec = {
             mode: $c.mode
             corner: ($c.corner? | default "bottom-right")
             from: $acc.cursor
             to: $to
+            image: $image
         }
         { out: ($acc.out | append $rec), cursor: $to }
     }
@@ -185,7 +203,17 @@ def merge-windows [windows: list<list<float>>]: nothing -> list<list<float>> {
 
 # Build the complete filter_complex string.
 # Returns a record: { graph: string, out_label: string }
-export def build-graph [cues: list<record>, layout: record]: nothing -> record {
+#
+# `screen_synthetic` signals that input 0 is a `color=black` lavfi stand-in
+# (set when the talk has no real screen recording but has image cues). The
+# HDR-aware `NORMALIZE_YUV` is skipped on that input — zscale expects
+# color-tagged YUV and the lavfi source is neither HDR nor tagged.
+export def build-graph [
+    cues: list<record>
+    layout: record
+    body_dur: float
+    screen_synthetic: bool = false
+]: nothing -> record {
     let w = ($layout.resolution | get 0)
     let h = ($layout.resolution | get 1)
     let pip_w = ($layout.pip_size | get 0)
@@ -215,6 +243,29 @@ export def build-graph [cues: list<record>, layout: record]: nothing -> record {
             t2: $c.to
         }
     })
+
+    # Image cues get one ffmpeg input each, starting at input index 2 (after
+    # screen=0, speaker=1). Preserve cue-order so input indices are stable.
+    let image_entries = ($cues | enumerate | reduce --fold { out: [], k: 0 } { |it, acc|
+        let c = $it.item
+        if ($c.image? | default null) == null {
+            $acc
+        } else {
+            let entry = {
+                cue_idx: $it.index
+                input_idx: (2 + $acc.k)
+                mode: $c.mode
+                t1: $c.from
+                t2: $c.to
+            }
+            { out: ($acc.out | append $entry), k: ($acc.k + 1) }
+        }
+    } | get out)
+    # screen-primary / screen-only: image fills the canvas, folded into [scr].
+    # speaker-primary: image is the PiP (speaker full-frame covers the base),
+    # folded into [scr_pip].
+    let full_image_entries = ($image_entries | where mode in ["screen-primary" "screen-only"])
+    let pip_image_entries = ($image_entries | where mode == "speaker-primary")
 
     # Per-mode, per-corner groups. The same windows drive both x
     # (which slides) and y (which steps between top and bottom).
@@ -249,8 +300,15 @@ export def build-graph [cues: list<record>, layout: record]: nothing -> record {
     let merged_base_windows = (merge-windows ($speaker_primary_windows ++ $speaker_only_windows))
     let has_speaker_primary = (not ($speaker_primary_windows | is-empty))
 
+    # Skip NORMALIZE_YUV on synthetic (lavfi color=black) input 0.
+    let scr_in_prefix = if $screen_synthetic { "" } else { $"($NORMALIZE_YUV)," }
+    # When image cues feed [scr] or [scr_pip], rename the base layer so the
+    # fold chain can terminate at the canonical name.
+    let scr_base_label = if ($full_image_entries | is-empty) { "scr" } else { "scr_raw" }
+    let scr_pip_base_label = if ($pip_image_entries | is-empty) { "scr_pip" } else { "scr_pip_raw" }
+
     let nodes_common = [
-        $"[0:v]setpts=PTS-STARTPTS,fps=($fps),($NORMALIZE_YUV),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1[scr]"
+        $"[0:v]setpts=PTS-STARTPTS,fps=($fps),($scr_in_prefix)scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1[($scr_base_label)]"
         $"[1:v]setpts=PTS-STARTPTS,fps=($fps),($NORMALIZE_YUV),scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,format=yuva420p[cam_pip]"
     ]
     let n_base = ($merged_base_windows | length)
@@ -286,10 +344,79 @@ export def build-graph [cues: list<record>, layout: record]: nothing -> record {
         [$prep_node] ++ $fade_nodes
     }
     let nodes_scr_pip = if $has_speaker_primary {
-        [ $"[0:v]setpts=PTS-STARTPTS,fps=($fps),($NORMALIZE_YUV),scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,format=yuva420p[scr_pip]" ]
+        [ $"[0:v]setpts=PTS-STARTPTS,fps=($fps),($scr_in_prefix)scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,format=yuva420p[($scr_pip_base_label)]" ]
     } else {
         []
     }
+
+    # Image prep nodes: scale + color-convert + edge fades. The fade-at-
+    # boundary logic mirrors nodes_cam — fade only when the image cue abuts
+    # another cue, so transitions crossfade instead of hard-cutting to the
+    # screen base underneath.
+    let img_fade_args = { |t1: float, t2: float|
+        let needs_fade_in = ($t1 in $cue_tos)
+        let needs_fade_out = ($t2 in $cue_froms)
+        let fade_in = if $needs_fade_in { $",fade=t=in:st=($t1):d=($transition):alpha=1" } else { "" }
+        let fade_out_st = ($t2 - $transition)
+        let fade_out = if $needs_fade_out { $",fade=t=out:st=($fade_out_st):d=($transition):alpha=1" } else { "" }
+        $"($fade_in)($fade_out)"
+    }
+    # zscale runs after scale: the PNG decoder emits RGB with loose tags and
+    # zscale fails with "no path between colorspaces" when it sees the raw
+    # input directly. Running scale first normalizes the pipe, matching the
+    # proven chain in render-intro.nu.
+    #
+    # tpad surrounds the (cue-window-bounded) image stream with transparent
+    # frames so it spans the full body. Without this we'd either be processing
+    # 30 fps × body_dur frames per image through scale+zscale (pre-fix waste)
+    # or hit overlay-sync issues from a secondary input that doesn't exist
+    # outside [t1, t2]. tpad's padding frames are cheap (no scale/zscale).
+    let nodes_img_full = ($full_image_entries | each { |e|
+        let fades = (do $img_fade_args $e.t1 $e.t2)
+        let pre = $e.t1
+        let post = ($body_dur - $e.t2)
+        $"[($e.input_idx):v]setpts=PTS-STARTPTS,fps=($fps),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1,($NORMALIZE_SRGB),format=yuva420p,tpad=start_duration=($pre):stop_duration=($post):color=black@0($fades)[img_full_($e.cue_idx)]"
+    })
+    let nodes_img_pip = ($pip_image_entries | each { |e|
+        let fades = (do $img_fade_args $e.t1 $e.t2)
+        let pre = $e.t1
+        let post = ($body_dur - $e.t2)
+        $"[($e.input_idx):v]setpts=PTS-STARTPTS,fps=($fps),scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,($NORMALIZE_SRGB),format=yuva420p,tpad=start_duration=($pre):stop_duration=($post):color=black@0($fades)[img_pip_($e.cue_idx)]"
+    })
+
+    # Fold image full-frames into [scr] via a gated overlay chain:
+    #   [scr_raw][img_full_k0] -> [scr_step_k0]
+    #   [scr_step_k0][img_full_k1] -> [scr_step_k1]
+    #   ...
+    #   [scr_step_k{M-2}][img_full_k{M-1}] -> [scr]
+    let n_img_full = ($full_image_entries | length)
+    let nodes_scr_fold = ($full_image_entries | enumerate | each { |it|
+        let i = $it.index
+        let e = $it.item
+        let prev = if $i == 0 {
+            "scr_raw"
+        } else {
+            let pe = ($full_image_entries | get ($i - 1))
+            $"scr_step_($pe.cue_idx)"
+        }
+        let is_last = ($i == ($n_img_full - 1))
+        let next = if $is_last { "scr" } else { $"scr_step_($e.cue_idx)" }
+        $"[($prev)][img_full_($e.cue_idx)]overlay=0:0:enable='between\(t,($e.t1),($e.t2))':eof_action=pass[($next)]"
+    })
+    let n_img_pip = ($pip_image_entries | length)
+    let nodes_scr_pip_fold = ($pip_image_entries | enumerate | each { |it|
+        let i = $it.index
+        let e = $it.item
+        let prev = if $i == 0 {
+            "scr_pip_raw"
+        } else {
+            let pe = ($pip_image_entries | get ($i - 1))
+            $"scr_pip_step_($pe.cue_idx)"
+        }
+        let is_last = ($i == ($n_img_pip - 1))
+        let next = if $is_last { "scr_pip" } else { $"scr_pip_step_($e.cue_idx)" }
+        $"[($prev)][img_pip_($e.cue_idx)]overlay=0:0:enable='between\(t,($e.t1),($e.t2))':eof_action=pass[($next)]"
+    })
 
     let overlay_base = $"[scr][cam_pip]overlay=x='($screen_primary_x)':y='($screen_primary_y)':eof_action=pass[v1]"
 
@@ -313,6 +440,16 @@ export def build-graph [cues: list<record>, layout: record]: nothing -> record {
         }
     }
 
-    let graph = ($nodes_common ++ $nodes_cam ++ $nodes_scr_pip ++ $overlays | str join ";")
+    let graph = (
+        $nodes_common
+        ++ $nodes_cam
+        ++ $nodes_scr_pip
+        ++ $nodes_img_full
+        ++ $nodes_img_pip
+        ++ $nodes_scr_fold
+        ++ $nodes_scr_pip_fold
+        ++ $overlays
+        | str join ";"
+    )
     { graph: $graph, out_label: "vout" }
 }

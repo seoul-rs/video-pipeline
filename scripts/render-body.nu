@@ -1,7 +1,11 @@
 #!/usr/bin/env nu
-# Render the body segment. Two paths:
-#   - screen recording present -> PiP composite driven by cues
-#   - screen recording absent  -> the speaker video rescaled/re-encoded
+# Render the body segment. Three paths:
+#   - screen + cues present   -> PiP composite driven by cues (real screen
+#                                input 0; image cues overlay onto [scr])
+#   - no screen + cues present -> PiP composite with synthetic black base
+#                                 (lavfi color=black as input 0; every
+#                                 non-speaker-only cue must have an image)
+#   - no screen + no cues      -> speaker video rescaled/re-encoded
 #
 # Audio source precedence: sources.audio override > speaker track >
 # screen track > synthesized silence (keeps concat stream-count stable).
@@ -60,11 +64,14 @@ def main [cue_path: string] {
     let speaker = ($cue.sources.speaker | path expand)
     let screen = (if ($cue.sources.screen? | is-empty) { null } else { $cue.sources.screen | path expand })
     let audio_override = (if ($cue.sources.audio? | is-empty) { null } else { $cue.sources.audio | path expand })
+    let cues = ($cue.cues? | default [])
+    let offset = (($cue.sync?.screen_offset? | default 0) | into float)
 
     mkdir work
 
-    if $screen == null {
-        print "no screen recording set: body = rescaled speaker video"
+    # Simple path: no screen, no cues -> just rescale the speaker.
+    if $screen == null and ($cues | is-empty) {
+        print "no screen recording, no cues: body = rescaled speaker video"
 
         let audio_plan = if $audio_override != null {
             { kind: "file", path: $audio_override }
@@ -96,47 +103,89 @@ def main [cue_path: string] {
         return
     }
 
-    print "screen + speaker both set: PiP composite"
+    # Composite path. Input 0 is either the real screen recording or a
+    # black `color=` lavfi stand-in when the talk has no screen but uses
+    # image cues.
+    let screen_synthetic = ($screen == null)
 
-    let offset = (($cue.sync?.screen_offset? | default 0) | into float)
-    let cues = ($cue.cues? | default [])
-    if ($cues | is-empty) {
-        error make { msg: "screen is set but [[cues]] is empty - add at least one cue" }
+    if $screen_synthetic {
+        print "no screen recording: body = speaker + image cues over synthetic base"
+        # Every non-speaker-only cue must supply its own image, since the
+        # lavfi base is just black.
+        for it in ($cues | enumerate) {
+            let c = $it.item
+            if $c.mode != "speaker-only" and ($c.image? | is-empty) {
+                error make { msg: $"cue ($it.index) \(mode=($c.mode)): sources.screen is not set, so this cue requires an `image`" }
+            }
+        }
+        if $offset != 0.0 {
+            error make { msg: "sync.screen_offset is only meaningful when sources.screen is set" }
+        }
+    } else {
+        print "screen + speaker both set: PiP composite"
+        if ($cues | is-empty) {
+            error make { msg: "screen is set but [[cues]] is empty - add at least one cue" }
+        }
     }
 
     # Trim the head of whichever stream started first so both open at the
     # same real-world moment. -ss before -i seeks the input (audio + video
     # together), so audio stays in sync with its source video. -itsoffset
     # would be cancelled by the setpts=PTS-STARTPTS in the filter graph.
-    let screen_pre = if $offset < 0.0 { ["-ss" (($offset * -1.0) | into string)] } else { [] }
-    let speaker_pre = if $offset > 0.0 { ["-ss" ($offset | into string)] } else { [] }
+    # Neither offset applies when there's no real screen.
+    let screen_pre = if (not $screen_synthetic) and $offset < 0.0 { ["-ss" (($offset * -1.0) | into string)] } else { [] }
+    let speaker_pre = if (not $screen_synthetic) and $offset > 0.0 { ["-ss" ($offset | into string)] } else { [] }
 
-    # Speaker duration after the head-trim; this is what `until = "end"`
-    # resolves to, matching the effective body timeline (t=0 post-seek).
-    let speaker_dur = (probe-duration $speaker) - (if $offset > 0.0 { $offset } else { 0.0 })
+    # Speaker duration after any head-trim. `until = "end"` resolves to this.
+    let speaker_dur = if (not $screen_synthetic) and $offset > 0.0 {
+        (probe-duration $speaker) - $offset
+    } else {
+        (probe-duration $speaker)
+    }
+    let speaker_dur_s = ($speaker_dur | into string)
+
     let normalized = (normalize-cues $cues $speaker_dur)
 
-    let g = (build-graph $normalized $layout)
+    # Image cues feed the graph as additional inputs at indices 2..(2+M-1),
+    # preserving cue order so filter-complex's input_idx math lines up. Each
+    # input is bounded to its cue's window: the per-image prep chain (scale,
+    # zscale colorspace, fade) only runs on frames that will actually appear,
+    # not the entire body duration. filter-complex pads the resulting stream
+    # back out to body length with cheap transparent frames via tpad.
+    let image_cues = ($normalized | where { ($in.image? | default null) != null })
+    let m = ($image_cues | length)
+    let image_inputs = ($image_cues | each { |c|
+        let dur = (($c.to - $c.from) + 0.5)
+        ["-loop" "1" "-framerate" $fps_s "-t" ($dur | into string) "-i" $c.image]
+    } | flatten)
+
+    let g = (build-graph $normalized $layout $speaker_dur $screen_synthetic)
+
+    let screen_input_args = if $screen_synthetic {
+        ["-f" "lavfi" "-i" $"color=c=black:s=($w)x($h):d=($speaker_dur_s):r=($fps)"]
+    } else {
+        [...$screen_pre "-i" $screen]
+    }
 
     let audio_plan = if $audio_override != null {
         { kind: "file", path: $audio_override }
     } else if (has-audio-stream $speaker) {
         { kind: "stream", map: "1:a:0" }
-    } else if (has-audio-stream $screen) {
+    } else if (not $screen_synthetic) and (has-audio-stream $screen) {
         print "speaker has no audio; falling back to screen audio"
         { kind: "stream", map: "0:a:0" }
     } else {
         print "no audio available; using silence"
         { kind: "silence" }
     }
-    let audio = (build-audio $audio_plan 2)
+    let audio = (build-audio $audio_plan (2 + $m))
 
     let args = [
         "-y"
-        ...$screen_pre
-        "-i" $screen
+        ...$screen_input_args
         ...$speaker_pre
         "-i" $speaker
+        ...$image_inputs
         ...$audio.inputs
         "-filter_complex" $g.graph
         "-map" $"[($g.out_label)]"
@@ -146,6 +195,7 @@ def main [cue_path: string] {
         "-colorspace" "bt709" "-color_primaries" "bt709" "-color_trc" "bt709" "-color_range" "tv"
         "-c:a" "aac" "-ar" "48000" "-ac" "2" "-b:a" "192k"
         "-r" $fps_s
+        "-t" $speaker_dur_s
         "-shortest"
         "-movflags" "+faststart"
         "work/body.mp4"
