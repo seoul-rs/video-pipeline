@@ -5,6 +5,8 @@
 #   0 -> concat demuxer with -c copy (fast; inputs are already codec-aligned)
 #   > 0 -> filter graph with xfade/acrossfade between segments (re-encodes)
 
+use ./config.nu *
+
 def probe-duration [path: string]: nothing -> float {
     ^ffprobe -v error -show_entries format=duration -of csv=p=0 $path
     | complete | get stdout | str trim | into float
@@ -57,10 +59,8 @@ def main [cue_path: string] {
         "-i" "work/outro.mp4"
         "-filter_complex" $filter
         "-map" "[vout]" "-map" "[aout]"
-        "-c:v" "libx264" "-preset" "medium" "-crf" "20"
-        "-pix_fmt" "yuv420p"
-        "-colorspace" "bt709" "-color_primaries" "bt709" "-color_trc" "bt709" "-color_range" "tv"
-        "-c:a" "aac" "-ar" "48000" "-ac" "2" "-b:a" "192k"
+        ...$VIDEO_ENCODE_ARGS
+        ...$AUDIO_ENCODE_ARGS
         "-movflags" "+faststart"
         "output/final.mp4"
     ]

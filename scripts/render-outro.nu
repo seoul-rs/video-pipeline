@@ -35,10 +35,9 @@ def main [cue_path: string] {
         "-loop" "1" "-t" ($audio_plan.dur | into string) "-i" "work/outro.png"
         ...$audio_plan.args
         "-vf" $"fps=($fps),scale=($w):($h),setsar=1,zscale=tin=iec61966-2-1:pin=bt709:min=bt709:rin=full:t=bt709:p=bt709:m=bt709:r=tv,format=yuv420p"
-        "-c:v" "libx264" "-tune" "stillimage" "-preset" "medium" "-crf" "20"
-        "-pix_fmt" "yuv420p"
-        "-colorspace" "bt709" "-color_primaries" "bt709" "-color_trc" "bt709" "-color_range" "tv"
-        "-c:a" "aac" "-ar" "48000" "-ac" "2" "-b:a" "192k"
+        ...$VIDEO_ENCODE_ARGS
+        "-tune" "stillimage"
+        ...$AUDIO_ENCODE_ARGS
         "-r" ($fps | into string)
         "-t" ($audio_plan.dur | into string)
         "-movflags" "+faststart"

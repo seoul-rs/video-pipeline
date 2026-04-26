@@ -5,6 +5,8 @@
 #   synthetic:     0 = speaker, 1.. = images
 # In synthetic mode the lavfi black canvas is gone — the concat'd image
 # track is the full-body screen layer.
+
+use ./config.nu *
 #
 # Applied to every YUV input at graph entry so downstream stages operate
 # in a single well-defined space. Linearize → primaries to BT.709 →
@@ -100,7 +102,7 @@ export def normalize-cues [
         }
         let rec = {
             mode: $c.mode
-            corner: ($corner_raw | default "bottom-right")
+            corner: ($corner_raw | default $DEFAULT_CORNER)
             from: $acc.cursor
             to: $to
             image: $image
@@ -262,7 +264,7 @@ export def build-graph [
 
     let cs = ($cues | each { |c|
         let mode = $c.mode
-        let corner = ($c.corner? | default "bottom-right")
+        let corner = ($c.corner? | default $DEFAULT_CORNER)
         if ($mode in ["screen-primary" "speaker-primary"]) and ($corner not-in $valid_corners) {
             error make { msg: $"cue corner '($corner)' is invalid. valid: ($valid_corners | str join ', ')" }
         }

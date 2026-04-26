@@ -11,6 +11,7 @@
 # screen track > synthesized silence (keeps concat stream-count stable).
 
 use ./filter-complex.nu *
+use ./config.nu *
 
 def has-audio-stream [path: string]: nothing -> bool {
     let r = (^ffprobe -v error -select_streams a
@@ -97,10 +98,8 @@ def main [cue_path: string] {
             "-vf" $"fps=($fps),($NORMALIZE_YUV),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1"
             "-map" "0:v"
             "-map" $audio.map
-            "-c:v" "libx264" "-preset" "medium" "-crf" "20"
-            "-pix_fmt" "yuv420p"
-            "-colorspace" "bt709" "-color_primaries" "bt709" "-color_trc" "bt709" "-color_range" "tv"
-            "-c:a" "aac" "-ar" "48000" "-ac" "2" "-b:a" "192k"
+            ...$VIDEO_ENCODE_ARGS
+            ...$AUDIO_ENCODE_ARGS
             "-r" $fps_s
             "-shortest"
             "-movflags" "+faststart"
@@ -215,10 +214,8 @@ def main [cue_path: string] {
         "-filter_complex" $g.graph
         "-map" $"[($g.out_label)]"
         "-map" $audio.map
-        "-c:v" "libx264" "-preset" "medium" "-crf" "20"
-        "-pix_fmt" "yuv420p"
-        "-colorspace" "bt709" "-color_primaries" "bt709" "-color_trc" "bt709" "-color_range" "tv"
-        "-c:a" "aac" "-ar" "48000" "-ac" "2" "-b:a" "192k"
+        ...$VIDEO_ENCODE_ARGS
+        ...$AUDIO_ENCODE_ARGS
         "-r" $fps_s
         "-t" $speaker_dur_s
         "-shortest"
