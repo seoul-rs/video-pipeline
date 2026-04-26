@@ -1,0 +1,449 @@
+-- allium: 3
+-- video-pipeline.allium
+
+-- Scope:    cue-driven video pipeline that renders a finished talk video
+--           from a cue file, talk recordings, and per-meetup branding.
+-- Includes: cue file validation, intro/body/outro segment composition,
+--           PiP and crossfade behaviour at cue boundaries, audio source
+--           precedence, sync correction.
+-- Excludes: ffmpeg filter-graph internals, codec/colorspace choices,
+--           specific tooling (just/nushell/ffmpeg/resvg/ffprobe), font
+--           selection, file paths for intermediates and output.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- Provided by: a video file on the local file system (e.g. recordings/*.mp4).
+external entity SourceVideo {
+    duration: Duration
+    has_audio: Boolean
+}
+
+-- Provided by: an image file on the local file system (e.g. slides/*.png).
+external entity SourceImage { }
+
+-- Provided by: an audio file on the local file system (e.g. recordings/lav.wav).
+external entity SourceAudio {
+    duration: Duration
+}
+
+-- Provided by: per-meetup branding files checked into the repository under
+-- assets/ (intro.svg, outro.svg, optional intro.wav and outro.wav).
+external entity Branding {
+    -- SVG template containing {{TITLE}}, {{SPEAKER}}, {{DATE}} placeholders.
+    intro_template: String
+    -- Static SVG; no placeholders.
+    outro_card: String
+    -- Optional sting played over the intro card.
+    intro_audio: SourceAudio?
+    -- Optional sting played over the outro card.
+    outro_audio: SourceAudio?
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value Resolution {
+    width: Integer
+    height: Integer
+}
+
+value Layout {
+    resolution: Resolution
+    fps: Integer
+    pip_size: Resolution
+    pip_margin: Integer
+    -- Duration of the PiP slide-in/out at cue boundaries and the
+    -- speaker base-layer crossfade between full-screen mode windows.
+    transition_duration: Duration
+    -- Crossfade between intro/body/outro segments. 0 = hard cut.
+    xfade_duration: Duration
+}
+
+value SyncCorrection {
+    -- Signed seconds. Positive: screen ahead of speaker (head of screen
+    -- is trimmed). Negative: screen behind speaker (head of speaker is
+    -- trimmed). Zero: aligned.
+    screen_offset: Duration
+}
+
+value SourceSet {
+    speaker: SourceVideo
+    -- Optional screen capture. When omitted with cues present, every
+    -- non-speaker-only cue must declare an image.
+    screen: SourceVideo?
+    -- Optional override; takes precedence over speaker/screen audio.
+    audio: SourceAudio?
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum Corner { bottom_right | top_right | top_left | bottom_left }
+
+-- speaker_only:    speaker fills the canvas; no screen.
+-- screen_only:     screen fills the canvas; no speaker.
+-- speaker_primary: speaker fills the canvas; screen as PiP.
+-- screen_primary:  screen fills the canvas; speaker as PiP.
+enum CueMode { speaker_only | screen_only | speaker_primary | screen_primary }
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity CueFile {
+    title: String      -- 1+ lines; line count drives intro card font size
+    speaker: String
+    date: String
+    sources: SourceSet
+    sync: SyncCorrection
+    layout: Layout
+    cues: Cue with cue_file = this
+
+    has_screen: sources.screen != null
+    has_cues: cues.count > 0
+
+    -- The body's effective duration after any head-trim from sync offset.
+    body_duration:
+        if sync.screen_offset > 0.seconds: sources.speaker.duration - sync.screen_offset
+        else: sources.speaker.duration
+
+    -- Body composition path:
+    --   rescaled_speaker: no screen and no cues; body is the rescaled speaker.
+    --   composite:        cues drive a PiP composite. The screen role is
+    --                     served by sources.screen when present; cues that
+    --                     declare an image replace the screen role for
+    --                     their window (whether or not sources.screen is
+    --                     set). Image cues and screen-video cues mix
+    --                     freely. When sources.screen is unset, every
+    --                     non-speaker-only cue must declare an image
+    --                     (see Cue.ImageRequiredWhenNoScreen).
+    composition:
+        if not has_screen and not has_cues: rescaled_speaker
+        else: composite
+
+    -- First available audio source in the precedence chain:
+    --   override:      sources.audio.
+    --   speaker_track: speaker recording's audio.
+    --   screen_track:  screen recording's audio.
+    --   silence:       synthesized; keeps stream count stable for concat.
+    audio_source:
+        if sources.audio != null: override
+        else if sources.speaker.has_audio: speaker_track
+        else if (sources.screen?.has_audio ?? false): screen_track
+        else: silence
+
+    invariant SyncOffsetRequiresScreen {
+        sync.screen_offset = 0.seconds or has_screen
+    }
+
+    invariant ScreenRequiresCues {
+        has_screen implies has_cues
+    }
+}
+
+entity Cue {
+    cue_file: CueFile
+    sequence: Integer        -- 0-based position in cue_file.cues
+    mode: CueMode
+    -- Resolved end of this cue's window. The last cue's `until = "end"`
+    -- sentinel in the cue file resolves to cue_file.body_duration.
+    until: Duration
+    -- Resolved start. CuesAreContiguous ties this to the previous cue.
+    from: Duration
+
+    -- Resting corner of the PiP. Only meaningful for *-primary modes;
+    -- absent on speaker-only and screen-only cues.
+    corner: Corner?
+
+    -- Replaces the screen role for this window. Forbidden on
+    -- speaker-only cues, which have no screen role.
+    image: SourceImage?
+
+    duration: until - from
+    has_image: image != null
+    is_first: sequence = 0
+    is_last: sequence = cue_file.cues.count - 1
+
+    -- Singular relationship to the immediately-preceding cue in the same
+    -- cue file. Null on the first cue. Used by the *_continuous_with_*
+    -- derived values to describe inner-seam transition behaviour.
+    predecessor: Cue with cue_file = this.cue_file
+                      and sequence = this.sequence - 1
+
+    -- Which feed fills the canvas during this cue's window.
+    is_speaker_mode: mode = speaker_only or mode = speaker_primary
+    is_screen_mode: mode = screen_only or mode = screen_primary
+
+    -- Which visual slot this cue's image (if any) occupies.
+    image_fills_canvas: has_image and is_screen_mode
+    image_fills_pip: has_image and mode = speaker_primary
+
+    -- Effective corner the PiP rests at, with the default applied. Null
+    -- on modes that have no PiP (speaker_only and screen_only).
+    effective_corner:
+        if mode = speaker_primary or mode = screen_primary:
+            corner ?? config.default_corner
+        else: null
+
+    ----------------------------------------------------------------
+    -- Inner-seam continuity flags. These describe the relationship
+    -- between this cue and its predecessor at the seam where
+    -- predecessor.until = this.from. They drive the rendering
+    -- transition behaviour described in CueSeamTransitions; see that
+    -- guidance for the regression history they encode.
+    ----------------------------------------------------------------
+
+    -- True iff the canvas-filling feed is the same on both sides of
+    -- the seam (both speaker-mode, or both screen-mode). Across this
+    -- seam the base layer must remain visually continuous: no
+    -- fade-out of the prior content followed by fade-in of the
+    -- next-but-identical content.
+    base_continuous_with_predecessor:
+        predecessor != null
+        and (
+            (is_speaker_mode and predecessor.is_speaker_mode)
+            or (is_screen_mode and predecessor.is_screen_mode)
+        )
+
+    -- True iff both cues display a PiP at the same corner, regardless of
+    -- which feed each cue has IN the PiP. Across this seam the PiP frame
+    -- rests in place; the slide-in/slide-out animation does not re-
+    -- trigger. The contents inside the frame (and the canvas behind it)
+    -- transition independently of the frame -- they crossfade if they
+    -- change. This is true for speaker-primary <-> screen-primary at the
+    -- same corner: the frame holds while both layers' contents swap.
+    pip_continuous_with_predecessor:
+        predecessor != null
+        and effective_corner != null
+        and predecessor.effective_corner != null
+        and effective_corner = predecessor.effective_corner
+
+    -- True iff both cues carry an image in the same role (both fill
+    -- the canvas, or both fill the PiP). Across this seam the image
+    -- content crossfades from the predecessor's image to this one
+    -- over layout.transition_duration; no hard cut and no slide.
+    image_continuous_with_predecessor:
+        predecessor != null
+        and (
+            (image_fills_canvas and predecessor.image_fills_canvas)
+            or (image_fills_pip and predecessor.image_fills_pip)
+        )
+
+    invariant NonEmptyWindow {
+        from < until
+    }
+
+    invariant FirstCueStartsAtZero {
+        is_first implies from = 0.seconds
+    }
+
+    invariant CornerOnlyOnPrimaryModes {
+        corner != null
+            implies (mode = speaker_primary or mode = screen_primary)
+    }
+
+    invariant ImageNotOnSpeakerOnly {
+        image != null implies mode != speaker_only
+    }
+
+    invariant ImageRequiredWhenNoScreen {
+        cue_file.has_screen
+            or mode = speaker_only
+            or image != null
+    }
+}
+
+-- The output produced by a render.
+entity FinalVideo {
+    cue_file: CueFile
+    branding: Branding
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Hold time for an intro/outro card when no audio sting is supplied.
+    default_segment_silence: Duration = 3.seconds
+    -- The PiP rests at this corner when a *-primary cue omits `corner`.
+    default_corner: Corner = bottom_right
+    -- Title line counts up to this number get adaptive font sizing.
+    -- Beyond this, the smallest font size is used and overflow is possible.
+    intro_title_max_lines: Integer = 4
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule RenderTalk {
+    when: RenderTalk(cue_file, branding)
+    ensures: FinalVideo.created(cue_file: cue_file, branding: branding)
+    ensures: BodyComposed(cue_file: cue_file)
+
+    @guidance
+        -- The final video concatenates three segments rendered with a
+        -- shared resolution, fps and color space:
+        --   1. Intro card: branding.intro_template with placeholders
+        --      replaced by cue_file.title, speaker and date, rendered
+        --      over branding.intro_audio (or default_segment_silence
+        --      when absent). Title font shrinks for 3 and 4 lines so
+        --      the block stays within the canvas; line counts beyond
+        --      intro_title_max_lines fall back to the smallest size.
+        --   2. Body: composition follows cue_file.composition:
+        --        rescaled_speaker - no screen and no cues; the body is
+        --                           the speaker video rescaled to
+        --                           layout.resolution. No PiP, no
+        --                           transitions.
+        --        composite        - cues drive a PiP composite. The
+        --                           screen role is sources.screen,
+        --                           replaced per-window by each cue's
+        --                           image when present. With no
+        --                           sources.screen, the screen role is
+        --                           a synthetic black canvas painted
+        --                           by image cues per
+        --                           ImageRequiredWhenNoScreen. Image
+        --                           cues and screen-video cues mix
+        --                           freely.
+        --      Within the body, cue_file.cues drive composition:
+        --        speaker_only     - speaker fills the canvas; nothing else.
+        --        screen_only      - screen role fills the canvas; no speaker.
+        --        speaker_primary  - speaker fills the canvas; screen role as PiP.
+        --        screen_primary   - screen role fills the canvas; speaker as PiP.
+        --      Inner-seam transition behaviour is governed by
+        --      CueSeamTransitions.
+        --      Body audio is selected by cue_file.audio_source.
+        --      A non-zero sync.screen_offset trims the head of whichever
+        --      recording started earlier so both open at the same
+        --      real-world moment (positive: trim screen head; negative:
+        --      trim speaker head). Body length follows from the post-
+        --      trim speaker duration; see body_duration.
+        --   3. Outro card: branding.outro_card rendered over
+        --      branding.outro_audio (or default_segment_silence).
+        -- Adjacent segments are joined by layout.xfade_duration; 0
+        -- means a hard cut.
+}
+
+-- Transition behaviour at the inner seams between adjacent cues. The
+-- transition_duration governs every per-element animation referenced
+-- below. Every clause exists to lock in a previously-fixed regression;
+-- changing this rule's contract should be a deliberate, reviewed act.
+rule CueSeamTransitions {
+    when: BodyComposed(cue_file)
+    requires: cue_file.has_cues
+    ensures: CueSeamsTransitioned(cue_file: cue_file)
+
+    @guidance
+        -- For each cue with a predecessor (i.e. every cue except the
+        -- first), the seam at predecessor.until = this.from decomposes
+        -- into four independent elements. Each element transitions
+        -- only when its own continuity is broken. Frames (the PiP box,
+        -- the body outer boundary) animate by sliding/fading; content
+        -- inside a frame crossfades. Frame motion and content change
+        -- never substitute for each other -- if the frame holds and
+        -- the content changes, only the content crossfades.
+        --
+        -- (1) Canvas feed. base_continuous_with_predecessor is true
+        -- iff both cues fill the canvas with the same feed-class
+        -- (both speaker-mode, or both screen-mode). When true, the
+        -- canvas remains visually continuous across the seam: no
+        -- fade-out followed by fade-in. When false (the seam crosses
+        -- between speaker-mode and screen-mode), the canvas crossfades
+        -- between the two feeds over transition_duration. Note that
+        -- canvas content can also change *within* a continuous
+        -- feed-class -- e.g. an image-bearing screen_primary cue
+        -- followed by a video-only screen_primary cue substitutes a
+        -- different image into the screen role; the canvas crossfades
+        -- between the image and the screen video while the
+        -- feed-class continuity is preserved.
+        --   Bug class: PiP slid off and slid back in between adjacent
+        --   speaker-primary and speaker-only cues, treating the seam
+        --   as a transition out of and back into the screen base.
+        --   Fix: see commit 17a8b206 ("Cleanup transitions in and out
+        --   of screen view"); fused speaker_primary + speaker_only
+        --   adjacent windows so the cam layer stays opaque across the
+        --   seam.
+        --
+        -- (2) PiP frame. pip_continuous_with_predecessor is true iff
+        -- both cues display a PiP at the same effective_corner --
+        -- regardless of which mode each cue uses. When true, the PiP
+        -- frame rests in place at the seam; the slide-in/slide-out
+        -- animation does not re-trigger. When false (the corner
+        -- changed, or the PiP appeared, or the PiP disappeared), the
+        -- PiP frame slides horizontally from the nearest canvas edge
+        -- over transition_duration into or out of its new resting
+        -- position.
+        --   Bug class (anticipated, prevents future regression): a
+        --   speaker_primary -> screen_primary seam at the same corner
+        --   would slide the speaker-as-PiP frame off and immediately
+        --   slide the screen-as-PiP frame back in, producing a
+        --   visible double-slide artefact. The correct behaviour is
+        --   that the frame holds in place and its contents crossfade
+        --   (see element (3) below).
+        --
+        -- (3) PiP content. When pip_continuous_with_predecessor is
+        -- true, the contents inside the held PiP frame crossfade from
+        -- the predecessor's PiP feed to this one over
+        -- transition_duration. This includes:
+        --     speaker_primary -> screen_primary at same corner:
+        --       PiP content crossfades screen-feed -> speaker-feed
+        --       while the canvas crossfades speaker-feed -> screen-
+        --       feed. The two crossfades run in parallel and the
+        --       frame stays put.
+        --     image_continuous_with_predecessor true (image_fills_pip
+        --       on both): PiP content crossfades between the two
+        --       images.
+        -- When pip_continuous_with_predecessor is false, the frame
+        -- itself is animating, so the content moves with it and no
+        -- separate content crossfade applies.
+        --   Bug class: image-to-image transition between two
+        --   screen-primary cues hard-cut between images (or briefly
+        --   revealed the screen base behind them) instead of
+        --   crossfading.
+        --   Fix: see commit 7c962f73 ("WIP; fix bug with image->image
+        --   transitions"); built per-routing xfade chains so adjacent
+        --   same-routing image cues blend instead of cutting. The
+        --   same crossfade discipline applies to canvas-filling
+        --   image runs (see image_fills_canvas).
+        --
+        -- (4) Body outer edges. No fade is applied at the body's
+        -- outer edges (the first cue's `from` = 0.seconds, the last
+        -- cue's `until` = body_duration), because revealing the
+        -- screen base or void during a fade-in/out at those points
+        -- would look wrong. Inter-segment transitions between intro,
+        -- body and outro are governed separately by
+        -- layout.xfade_duration.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Adjacent cues are contiguous: each cue's `from` matches the previous
+-- cue's `until`. Together with NonEmptyWindow this gives a strictly
+-- monotonic, gap-free timeline.
+invariant CuesAreContiguous {
+    for cf in CueFiles:
+        for c in cf.cues:
+            for p in cf.cues:
+                p.cue_file = cf and p.sequence = c.sequence - 1
+                    implies c.from = p.until
+}
+
+-- The last cue's `until` must reach the end of the body. Otherwise the
+-- body past it would fall through to the screen base (or synthetic
+-- black) with no overlays, which is never the intended composition.
+-- Cue files that violate this must be rejected upfront, not rendered.
+-- The `until = "end"` sentinel in the cue file is the recommended way
+-- to satisfy this; an explicit timestamp matching body_duration is
+-- also valid.
+invariant LastCueCoversBody {
+    for cf in CueFiles:
+        for c in cf.cues:
+            c.is_last implies c.until = cf.body_duration
+}

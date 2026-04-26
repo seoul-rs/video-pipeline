@@ -67,6 +67,13 @@ def main [cue_path: string] {
     let cues = ($cue.cues? | default [])
     let offset = (($cue.sync?.screen_offset? | default 0) | into float)
 
+    # Spec invariant SyncOffsetRequiresScreen: offset is only meaningful
+    # when sources.screen is set. Enforce before path branching so the
+    # rescaled-speaker fast path rejects it too.
+    if $screen == null and $offset != 0.0 {
+        error make { msg: "sync.screen_offset is only meaningful when sources.screen is set" }
+    }
+
     mkdir work
 
     # Simple path: no screen, no cues -> just rescale the speaker.
@@ -117,9 +124,6 @@ def main [cue_path: string] {
             if $c.mode != "speaker-only" and ($c.image? | is-empty) {
                 error make { msg: $"cue ($it.index) \(mode=($c.mode)): sources.screen is not set, so this cue requires an `image`" }
             }
-        }
-        if $offset != 0.0 {
-            error make { msg: "sync.screen_offset is only meaningful when sources.screen is set" }
         }
     } else {
         print "screen + speaker both set: PiP composite"

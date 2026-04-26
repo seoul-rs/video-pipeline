@@ -61,12 +61,15 @@ export def parse-hms [s: string]: nothing -> float {
 # value `until = "end"` → `video_duration`. Enforces:
 #   - monotonicity: each `until` strictly greater than the running `from`
 #   - `"end"` only on the last cue
+#   - last cue's `until` reaches video_duration (LastCueCoversBody)
+#   - `corner` only on `speaker-primary` / `screen-primary` cues
+#     (CornerOnlyOnPrimaryModes)
 export def normalize-cues [
     cues: list<record>
     video_duration: float
 ]: nothing -> list<record> {
     let n = ($cues | length)
-    $cues | enumerate | reduce --fold { out: [], cursor: 0.0 } { |it, acc|
+    let normalized = ($cues | enumerate | reduce --fold { out: [], cursor: 0.0 } { |it, acc|
         let i = $it.index
         let c = $it.item
         let is_last = ($i == ($n - 1))
@@ -91,16 +94,34 @@ export def normalize-cues [
                 error make { msg: $"cue ($i): image file not found: ($image)" }
             }
         }
+        let corner_raw = ($c.corner? | default null)
+        if $corner_raw != null and ($c.mode not-in ["speaker-primary" "screen-primary"]) {
+            error make { msg: $"cue ($i): `corner` is only valid on `speaker-primary` or `screen-primary` cues, not `($c.mode)`" }
+        }
         let rec = {
             mode: $c.mode
-            corner: ($c.corner? | default "bottom-right")
+            corner: ($corner_raw | default "bottom-right")
             from: $acc.cursor
             to: $to
             image: $image
         }
         { out: ($acc.out | append $rec), cursor: $to }
     }
-    | get out
+    | get out)
+
+    # LastCueCoversBody: the body past the final cue would fall through to
+    # the screen base (or synthetic black) with no overlays, which is never
+    # the intended composition. The `until = "end"` sentinel is the
+    # recommended way to satisfy this; an explicit timestamp matching
+    # video_duration is also valid.
+    if $n > 0 {
+        let last_to = ($normalized | last | get to)
+        if $last_to < $video_duration {
+            error make { msg: $"last cue ends at ($last_to)s but body runs to ($video_duration)s; use `until = \"end\"` or extend the last cue's `until` to cover the body" }
+        }
+    }
+
+    $normalized
 }
 
 # Sine envelope that ramps 0 -> 1 over [t1, t1+d] and 1 -> 0 over [t2-d, t2].

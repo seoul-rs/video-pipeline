@@ -5,6 +5,8 @@
 #
 # Writes output to work/intro.mp4.
 
+use ./config.nu *
+
 const TITLE_X = 960
 
 # Per-line-count layout: font size, line height (1.2em), the vertical center
@@ -74,8 +76,8 @@ def main [cue_path: string] {
         print "muxing with assets/intro.wav"
         { args: ["-i" "assets/intro.wav"], dur: $dur }
     } else {
-        print "no assets/intro.wav found - using 3s of silence"
-        { args: ["-f" "lavfi" "-i" "anullsrc=r=48000:cl=stereo"], dur: 3.0 }
+        print $"no assets/intro.wav found - using ($DEFAULT_SEGMENT_SILENCE_SECS)s of silence"
+        { args: ["-f" "lavfi" "-i" "anullsrc=r=48000:cl=stereo"], dur: $DEFAULT_SEGMENT_SILENCE_SECS }
     }
 
     let args = [

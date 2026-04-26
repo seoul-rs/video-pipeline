@@ -4,6 +4,8 @@
 #
 # Renders output to work/outro.mp4.
 
+use ./config.nu *
+
 def main [cue_path: string] {
     let cue = open $cue_path
     let w = ($cue.layout.resolution | get 0)
@@ -24,8 +26,8 @@ def main [cue_path: string] {
         print "muxing with assets/outro.wav"
         { args: ["-i" "assets/outro.wav"], dur: $dur }
     } else {
-        print "no assets/outro.wav found - using 3s of silence"
-        { args: ["-f" "lavfi" "-i" "anullsrc=r=48000:cl=stereo"], dur: 3.0 }
+        print $"no assets/outro.wav found - using ($DEFAULT_SEGMENT_SILENCE_SECS)s of silence"
+        { args: ["-f" "lavfi" "-i" "anullsrc=r=48000:cl=stereo"], dur: $DEFAULT_SEGMENT_SILENCE_SECS }
     }
 
     let args = [
