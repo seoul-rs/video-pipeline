@@ -1,6 +1,10 @@
 # Helpers for generating the body-render filter_complex string.
 #
-# Input indexing: 0 = screen, 1 = speaker.
+# Input indexing depends on whether a real screen recording exists:
+#   non-synthetic: 0 = screen, 1 = speaker, 2.. = images
+#   synthetic:     0 = speaker, 1.. = images
+# In synthetic mode the lavfi black canvas is gone — the concat'd image
+# track is the full-body screen layer.
 #
 # Applied to every YUV input at graph entry so downstream stages operate
 # in a single well-defined space. Linearize → primaries to BT.709 →
@@ -204,16 +208,21 @@ def merge-windows [windows: list<list<float>>]: nothing -> list<list<float>> {
 # Build the complete filter_complex string.
 # Returns a record: { graph: string, out_label: string }
 #
-# `screen_synthetic` signals that input 0 is a `color=black` lavfi stand-in
-# (set when the talk has no real screen recording but has image cues). The
-# HDR-aware `NORMALIZE_YUV` is skipped on that input — zscale expects
-# color-tagged YUV and the lavfi source is neither HDR nor tagged.
+# `screen_synthetic` signals that the talk has no real screen recording
+# (only image cues). In that mode there is no `[0:v]` lavfi stand-in: the
+# concat'd image track *is* the screen layer, so the speaker shifts to
+# input 0 and images start at input 1. Caller (render-body.nu) skips the
+# lavfi `-i` accordingly.
 export def build-graph [
     cues: list<record>
     layout: record
     body_dur: float
     screen_synthetic: bool = false
 ]: nothing -> record {
+    # Input indexing — see top-of-file comment.
+    let screen_offset = (if $screen_synthetic { 0 } else { 1 })
+    let speaker_idx = $screen_offset
+    let image_input_base = (1 + $screen_offset)
     let w = ($layout.resolution | get 0)
     let h = ($layout.resolution | get 1)
     let pip_w = ($layout.pip_size | get 0)
@@ -244,48 +253,86 @@ export def build-graph [
         }
     })
 
-    # Image cues get one ffmpeg input each, starting at input index 2 (after
-    # screen=0, speaker=1). Preserve cue-order so input indices are stable.
+    # Routing: which image-track an image cue feeds.
+    #   screen-primary / screen-only -> "full" (fills canvas, folded into [scr])
+    #   speaker-primary              -> "pip"  (fills PiP, folded into [scr_pip])
+    let route_of = { |mode|
+        if $mode in ["screen-primary" "screen-only"] { "full" } else if $mode == "speaker-primary" { "pip" } else { null }
+    }
+
+    # Image cues get one ffmpeg input each, starting at $image_input_base.
+    # Preserve cue order so input indices are stable.
+    #
+    # `lead_in` flags an entry whose immediately-preceding cue is also an
+    # image cue with the same routing — i.e. the cue chains into this one
+    # via xfade. Such entries get their input duration extended by
+    # `transition` (in render-body.nu) and skip the alpha fade-in (xfade
+    # handles the blend). render-body.nu uses the same routing+predecessor
+    # test, so the two stay in lockstep.
     let image_entries = ($cues | enumerate | reduce --fold { out: [], k: 0 } { |it, acc|
         let c = $it.item
         if ($c.image? | default null) == null {
             $acc
         } else {
+            let routing = (do $route_of $c.mode)
+            let lead_in = if $it.index > 0 {
+                let p = ($cues | get ($it.index - 1))
+                let p_image = ($p.image? | default null)
+                let p_routing = (do $route_of $p.mode)
+                ($p_image != null) and ($p_routing == $routing) and ($p.to == $c.from)
+            } else { false }
             let entry = {
                 cue_idx: $it.index
-                input_idx: (2 + $acc.k)
+                input_idx: ($image_input_base + $acc.k)
                 mode: $c.mode
+                routing: $routing
                 t1: $c.from
                 t2: $c.to
+                lead_in: $lead_in
             }
             { out: ($acc.out | append $entry), k: ($acc.k + 1) }
         }
     } | get out)
-    # screen-primary / screen-only: image fills the canvas, folded into [scr].
-    # speaker-primary: image is the PiP (speaker full-frame covers the base),
-    # folded into [scr_pip].
-    let full_image_entries = ($image_entries | where mode in ["screen-primary" "screen-only"])
-    let pip_image_entries = ($image_entries | where mode == "speaker-primary")
+    # `trail_out` mirrors `lead_in`: true when the next image entry in the
+    # same routing is the chronologically-next cue. Drives "skip fade-out
+    # on this clip; xfade with the next clip handles the blend."
+    let attach_trail = { |entries: list<record>|
+        let n = ($entries | length)
+        $entries | enumerate | each { |it|
+            let i = $it.index
+            let e = $it.item
+            let trail_out = if $i < ($n - 1) {
+                let next = ($entries | get ($i + 1))
+                ($next.lead_in) and ($next.cue_idx == ($e.cue_idx + 1))
+            } else { false }
+            $e | upsert trail_out $trail_out
+        }
+    }
+    let full_image_entries = (do $attach_trail ($image_entries | where routing == "full"))
+    let pip_image_entries = (do $attach_trail ($image_entries | where routing == "pip"))
 
     # Per-mode, per-corner groups. The same windows drive both x
     # (which slides) and y (which steps between top and bottom).
+    # Adjacent same-mode same-corner cues fuse into one window so the
+    # PiP rests through the seam instead of sliding off and back in
+    # — mirrors the merge applied to `merged_base_windows` for cam.
     let screen_primary_x_groups = ($valid_corners | each { |c|
-        let windows = ($cs | where mode == "screen-primary" and corner == $c | each { |x| [$x.t1, $x.t2] })
+        let windows = (merge-windows ($cs | where mode == "screen-primary" and corner == $c | each { |x| [$x.t1, $x.t2] }))
         let spec = (corner-spec $c $w $h $pip_w $pph $ppw $margin)
         { windows: $windows, off: $spec.off_x, rest: $spec.rest_x }
     })
     let screen_primary_y_groups = ($valid_corners | each { |c|
-        let windows = ($cs | where mode == "screen-primary" and corner == $c | each { |x| [$x.t1, $x.t2] })
+        let windows = (merge-windows ($cs | where mode == "screen-primary" and corner == $c | each { |x| [$x.t1, $x.t2] }))
         let spec = (corner-spec $c $w $h $pip_w $pph $ppw $margin)
         { windows: $windows, off: $spec.y, rest: $spec.y }
     })
     let speaker_primary_x_groups = ($valid_corners | each { |c|
-        let windows = ($cs | where mode == "speaker-primary" and corner == $c | each { |x| [$x.t1, $x.t2] })
+        let windows = (merge-windows ($cs | where mode == "speaker-primary" and corner == $c | each { |x| [$x.t1, $x.t2] }))
         let spec = (corner-spec $c $w $h $pip_w $pph $ppw $margin)
         { windows: $windows, off: $spec.off_x, rest: $spec.rest_x }
     })
     let speaker_primary_y_groups = ($valid_corners | each { |c|
-        let windows = ($cs | where mode == "speaker-primary" and corner == $c | each { |x| [$x.t1, $x.t2] })
+        let windows = (merge-windows ($cs | where mode == "speaker-primary" and corner == $c | each { |x| [$x.t1, $x.t2] }))
         let spec = (corner-spec $c $w $h $pip_w $pph $ppw $margin)
         { windows: $windows, off: $spec.y, rest: $spec.y }
     })
@@ -300,16 +347,29 @@ export def build-graph [
     let merged_base_windows = (merge-windows ($speaker_primary_windows ++ $speaker_only_windows))
     let has_speaker_primary = (not ($speaker_primary_windows | is-empty))
 
-    # Skip NORMALIZE_YUV on synthetic (lavfi color=black) input 0.
-    let scr_in_prefix = if $screen_synthetic { "" } else { $"($NORMALIZE_YUV)," }
-    # When image cues feed [scr] or [scr_pip], rename the base layer so the
-    # fold chain can terminate at the canonical name.
-    let scr_base_label = if ($full_image_entries | is-empty) { "scr" } else { "scr_raw" }
-    let scr_pip_base_label = if ($pip_image_entries | is-empty) { "scr_pip" } else { "scr_pip_raw" }
+    let has_full_imgs = (not ($full_image_entries | is-empty))
+    let has_pip_imgs = (not ($pip_image_entries | is-empty))
 
-    let nodes_common = [
-        $"[0:v]setpts=PTS-STARTPTS,fps=($fps),($scr_in_prefix)scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1[($scr_base_label)]"
-        $"[1:v]setpts=PTS-STARTPTS,fps=($fps),($NORMALIZE_YUV),scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,format=yuva420p[cam_pip]"
+    # Routing depends on (synthetic, has_imgs):
+    #   synthetic + has_imgs:        concat outputs directly to [scr] / [scr_pip];
+    #                                no separate base node.
+    #   non-synthetic + has_imgs:    [0:v] -> [scr_raw]; concat -> [img_track];
+    #                                [scr_raw][img_track]overlay -> [scr].
+    #   non-synthetic + no imgs:     [0:v] -> [scr] directly.
+    #   synthetic + no imgs:         disallowed by render-body validation.
+    let scr_base_label = if $has_full_imgs and (not $screen_synthetic) { "scr_raw" } else { "scr" }
+    let scr_pip_base_label = if $has_pip_imgs and (not $screen_synthetic) { "scr_pip_raw" } else { "scr_pip" }
+    let full_track_label = if $has_full_imgs and (not $screen_synthetic) { "img_track" } else { "scr" }
+    let pip_track_label = if $has_pip_imgs and (not $screen_synthetic) { "img_pip_track" } else { "scr_pip" }
+
+    # In synthetic mode there's no [0:v] — the concat'd image track is the
+    # screen layer. Skip the base prep node entirely in that case.
+    let nodes_common = (if $screen_synthetic {
+        []
+    } else {
+        [ $"[0:v]setpts=PTS-STARTPTS,fps=($fps),($NORMALIZE_YUV),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1[($scr_base_label)]" ]
+    }) ++ [
+        $"[($speaker_idx):v]setpts=PTS-STARTPTS,fps=($fps),($NORMALIZE_YUV),scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,format=yuva420p[cam_pip]"
     ]
     let n_base = ($merged_base_windows | length)
     # Fade edges only when the window abuts another cue — i.e. crossfade
@@ -324,7 +384,7 @@ export def build-graph [
     # Much cheaper than a time-varying per-pixel alpha expression, because
     # `fade` is SIMD-optimized and each slice only handles its own window.
     let nodes_cam = if $n_base == 0 { [] } else {
-        let prep_common = $"[1:v]setpts=PTS-STARTPTS,fps=($fps),($NORMALIZE_YUV),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1,format=yuva420p"
+        let prep_common = $"[($speaker_idx):v]setpts=PTS-STARTPTS,fps=($fps),($NORMALIZE_YUV),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1,format=yuva420p"
         let prep_node = if $n_base == 1 {
             $"($prep_common)[cam_src_0]"
         } else {
@@ -343,80 +403,183 @@ export def build-graph [
         })
         [$prep_node] ++ $fade_nodes
     }
-    let nodes_scr_pip = if $has_speaker_primary {
-        [ $"[0:v]setpts=PTS-STARTPTS,fps=($fps),($scr_in_prefix)scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,format=yuva420p[($scr_pip_base_label)]" ]
+    # In synthetic mode, [scr_pip] (when needed) is produced directly by the
+    # concat'd PiP image track — no separate base node from [0:v].
+    let nodes_scr_pip = if $has_speaker_primary and (not $screen_synthetic) {
+        [ $"[0:v]setpts=PTS-STARTPTS,fps=($fps),($NORMALIZE_YUV),scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,format=yuva420p[($scr_pip_base_label)]" ]
     } else {
         []
     }
 
-    # Image prep nodes: scale + color-convert + edge fades. The fade-at-
-    # boundary logic mirrors nodes_cam — fade only when the image cue abuts
-    # another cue, so transitions crossfade instead of hard-cutting to the
-    # screen base underneath.
-    let img_fade_args = { |t1: float, t2: float|
-        let needs_fade_in = ($t1 in $cue_tos)
-        let needs_fade_out = ($t2 in $cue_froms)
-        let fade_in = if $needs_fade_in { $",fade=t=in:st=($t1):d=($transition):alpha=1" } else { "" }
-        let fade_out_st = ($t2 - $transition)
-        let fade_out = if $needs_fade_out { $",fade=t=out:st=($fade_out_st):d=($transition):alpha=1" } else { "" }
-        $"($fade_in)($fade_out)"
-    }
+    # Per-cue image clips: scale + color-convert + clip-local edge fades.
+    # Fade-in only on a clip whose preceding cue is *not* a same-routing
+    # image — otherwise xfade with the previous clip handles the blend
+    # and a separate alpha fade-in would cause a midpoint dip. Same idea
+    # for fade-out: applied only at the trailing edge of a run. Inside a
+    # run, the second-and-later clips have their input duration extended
+    # by `transition` (in render-body.nu) so the xfade overlap doesn't
+    # shorten the timeline; the rest of the per-clip math falls out of
+    # `clip_dur` so the same fade_out_st formula works for both
+    # extended and non-extended clips.
+    #
     # zscale runs after scale: the PNG decoder emits RGB with loose tags and
     # zscale fails with "no path between colorspaces" when it sees the raw
     # input directly. Running scale first normalizes the pipe, matching the
     # proven chain in render-intro.nu.
-    #
-    # tpad surrounds the (cue-window-bounded) image stream with transparent
-    # frames so it spans the full body. Without this we'd either be processing
-    # 30 fps × body_dur frames per image through scale+zscale (pre-fix waste)
-    # or hit overlay-sync issues from a secondary input that doesn't exist
-    # outside [t1, t2]. tpad's padding frames are cheap (no scale/zscale).
-    let nodes_img_full = ($full_image_entries | each { |e|
-        let fades = (do $img_fade_args $e.t1 $e.t2)
-        let pre = $e.t1
-        let post = ($body_dur - $e.t2)
-        $"[($e.input_idx):v]setpts=PTS-STARTPTS,fps=($fps),scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1,($NORMALIZE_SRGB),format=yuva420p,tpad=start_duration=($pre):stop_duration=($post):color=black@0($fades)[img_full_($e.cue_idx)]"
+    let clip_prep = { |e: record, kind: string|
+        let cue_dur = ($e.t2 - $e.t1)
+        let clip_dur = $cue_dur + (if $e.lead_in { $transition } else { 0.0 })
+        let needs_fade_in = (not $e.lead_in) and ($e.t1 in $cue_tos)
+        let needs_fade_out = (not $e.trail_out) and ($e.t2 in $cue_froms)
+        let fade_in = if $needs_fade_in { $",fade=t=in:st=0:d=($transition):alpha=1" } else { "" }
+        let fade_out_st = ($clip_dur - $transition)
+        let fade_out = if $needs_fade_out { $",fade=t=out:st=($fade_out_st):d=($transition):alpha=1" } else { "" }
+        let scale_chain = if $kind == "full" {
+            $"scale=($w):($h):force_original_aspect_ratio=decrease,pad=($w):($h):\(ow-iw)/2:\(oh-ih)/2:black,setsar=1"
+        } else {
+            $"scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white"
+        }
+        let label = if $kind == "full" { $"img_clip_($e.cue_idx)" } else { $"img_pip_clip_($e.cue_idx)" }
+        $"[($e.input_idx):v]setpts=PTS-STARTPTS,fps=($fps),($scale_chain),($NORMALIZE_SRGB),format=yuva420p($fade_in)($fade_out)[($label)]"
+    }
+    let nodes_img_clip_full = ($full_image_entries | each { |e| do $clip_prep $e "full" })
+    let nodes_img_clip_pip = ($pip_image_entries | each { |e| do $clip_prep $e "pip" })
+
+    # Group consecutive entries into runs. A run is a maximal sequence
+    # where every entry after the first has lead_in=true (the prior cue
+    # in the source order is also a same-routing image cue that abuts).
+    # Within a run, adjacent clips xfade into each other; runs are
+    # separated by transparent gap segments in the concat.
+    let group_runs = { |entries: list<record>|
+        $entries | reduce --fold [] { |e, acc|
+            if ($acc | is-empty) {
+                [[$e]]
+            } else if $e.lead_in {
+                let last_run = ($acc | last)
+                ($acc | drop 1) | append [($last_run | append $e)]
+            } else {
+                $acc | append [[$e]]
+            }
+        }
+    }
+    let runs_full = (do $group_runs $full_image_entries)
+    let runs_pip = (do $group_runs $pip_image_entries)
+
+    # For each run: emit an xfade chain (zero nodes for a length-1 run)
+    # and decide the segment label that the concat will splice in.
+    # Length 1 -> the clip's own label is the segment.
+    # Length N -> chain `[a][b]xfade...[step1]; [step1][c]xfade...[step2]; ...`
+    #            with offset = (chain_dur_before - transition) per step,
+    #            so the run's output dur equals Σ cue_durs (= run time span).
+    let xfade_chain = { |run: list<record>, kind: string|
+        let n = ($run | length)
+        let clip_label = { |e: record|
+            if $kind == "full" { $"img_clip_($e.cue_idx)" } else { $"img_pip_clip_($e.cue_idx)" }
+        }
+        if $n <= 1 {
+            let e = ($run | first)
+            { nodes: [], out_label: (do $clip_label $e), dur: ($e.t2 - $e.t1) }
+        } else {
+            let first_e = ($run | first)
+            let prefix = if $kind == "full" { "img_run" } else { "img_pip_run" }
+            let init = {
+                nodes: []
+                chain_dur: ($first_e.t2 - $first_e.t1)
+                prev_label: (do $clip_label $first_e)
+            }
+            let acc = (1..($n - 1) | reduce --fold $init { |i, st|
+                let e = ($run | get $i)
+                let cue_dur = ($e.t2 - $e.t1)
+                let offset = ($st.chain_dur - $transition)
+                let is_last = ($i == ($n - 1))
+                let out_label = if $is_last {
+                    $"($prefix)_($first_e.cue_idx)"
+                } else {
+                    $"($prefix)_($first_e.cue_idx)_step_($i)"
+                }
+                let curr = (do $clip_label $e)
+                let node = $"[($st.prev_label)][($curr)]xfade=transition=fade:duration=($transition):offset=($offset)[($out_label)]"
+                {
+                    nodes: ($st.nodes | append $node)
+                    chain_dur: ($st.chain_dur + $cue_dur)
+                    prev_label: $out_label
+                }
+            })
+            { nodes: $acc.nodes, out_label: $acc.prev_label, dur: $acc.chain_dur }
+        }
+    }
+    let runs_full_built = ($runs_full | each { |r| do $xfade_chain $r "full" })
+    let runs_pip_built = ($runs_pip | each { |r| do $xfade_chain $r "pip" })
+    let nodes_xfade_full = ($runs_full_built | each { |b| $b.nodes } | flatten)
+    let nodes_xfade_pip = ($runs_pip_built | each { |b| $b.nodes } | flatten)
+
+    # Build the run-based segment sequence: gap, run, gap, run, ..., gap.
+    # Drop zero-duration gaps (run starts at body t=0 or ends at body_dur,
+    # or two runs of different routing share the same time span on the
+    # OTHER routing's track). Concat below stitches the surviving
+    # segments into one full-body track.
+    let build_run_segments = { |built: list<record>, runs: list<list<record>>, gap_prefix: string|
+        let n = ($built | length)
+        if $n == 0 {
+            []
+        } else {
+            let first_t1 = ($runs | first | first | get t1)
+            let init = if $first_t1 > 0.0 {
+                [ { kind: "gap", dur: $first_t1, label: $"($gap_prefix)_0" } ]
+            } else { [] }
+            $built | enumerate | reduce --fold $init { |it, acc|
+                let i = $it.index
+                let b = $it.item
+                let r = ($runs | get $i)
+                let with_run = ($acc | append { kind: "run", dur: $b.dur, label: $b.out_label })
+                let next_t = if $i == ($n - 1) { $body_dur } else { ($runs | get ($i + 1) | first | get t1) }
+                let last_t2 = ($r | last | get t2)
+                let gap_dur = ($next_t - $last_t2)
+                if $gap_dur > 0.0 {
+                    let gap_idx = ($i + 1)
+                    $with_run | append { kind: "gap", dur: $gap_dur, label: $"($gap_prefix)_($gap_idx)" }
+                } else {
+                    $with_run
+                }
+            }
+        }
+    }
+    let segs_full = (do $build_run_segments $runs_full_built $runs_full "gap_full")
+    let segs_pip = (do $build_run_segments $runs_pip_built $runs_pip "gap_pip")
+
+    # Gap source nodes: transparent yuva420p frames at the right size + duration.
+    # `colorchannelmixer=aa=0` zeroes the alpha channel after format conversion.
+    let nodes_gaps_full = ($segs_full | where kind == "gap" | each { |s|
+        $"color=c=black:s=($w)x($h):r=($fps):d=($s.dur),format=yuva420p,colorchannelmixer=aa=0[($s.label)]"
     })
-    let nodes_img_pip = ($pip_image_entries | each { |e|
-        let fades = (do $img_fade_args $e.t1 $e.t2)
-        let pre = $e.t1
-        let post = ($body_dur - $e.t2)
-        $"[($e.input_idx):v]setpts=PTS-STARTPTS,fps=($fps),scale=($pip_w):($pip_h),setsar=1,pad=($ppw):($pph):($border):($border):white,($NORMALIZE_SRGB),format=yuva420p,tpad=start_duration=($pre):stop_duration=($post):color=black@0($fades)[img_pip_($e.cue_idx)]"
+    let nodes_gaps_pip = ($segs_pip | where kind == "gap" | each { |s|
+        $"color=c=black:s=($ppw)x($pph):r=($fps):d=($s.dur),format=yuva420p,colorchannelmixer=aa=0[($s.label)]"
     })
 
-    # Fold image full-frames into [scr] via a gated overlay chain:
-    #   [scr_raw][img_full_k0] -> [scr_step_k0]
-    #   [scr_step_k0][img_full_k1] -> [scr_step_k1]
-    #   ...
-    #   [scr_step_k{M-2}][img_full_k{M-1}] -> [scr]
-    let n_img_full = ($full_image_entries | length)
-    let nodes_scr_fold = ($full_image_entries | enumerate | each { |it|
-        let i = $it.index
-        let e = $it.item
-        let prev = if $i == 0 {
-            "scr_raw"
-        } else {
-            let pe = ($full_image_entries | get ($i - 1))
-            $"scr_step_($pe.cue_idx)"
-        }
-        let is_last = ($i == ($n_img_full - 1))
-        let next = if $is_last { "scr" } else { $"scr_step_($e.cue_idx)" }
-        $"[($prev)][img_full_($e.cue_idx)]overlay=0:0:enable='between\(t,($e.t1),($e.t2))':eof_action=pass[($next)]"
-    })
-    let n_img_pip = ($pip_image_entries | length)
-    let nodes_scr_pip_fold = ($pip_image_entries | enumerate | each { |it|
-        let i = $it.index
-        let e = $it.item
-        let prev = if $i == 0 {
-            "scr_pip_raw"
-        } else {
-            let pe = ($pip_image_entries | get ($i - 1))
-            $"scr_pip_step_($pe.cue_idx)"
-        }
-        let is_last = ($i == ($n_img_pip - 1))
-        let next = if $is_last { "scr_pip" } else { $"scr_pip_step_($e.cue_idx)" }
-        $"[($prev)][img_pip_($e.cue_idx)]overlay=0:0:enable='between\(t,($e.t1),($e.t2))':eof_action=pass[($next)]"
-    })
+    # Concat the segment sequence (gaps + run outputs) into one
+    # full-body track, replacing what used to be a 47-deep serial overlay
+    # chain. Within each run, xfade chains the image cues; between runs,
+    # concat splices in transparent gaps so the screen base shows through.
+    let nodes_concat_full = if ($segs_full | is-empty) { [] } else {
+        let inputs = ($segs_full | each { |s| $"[($s.label)]" } | str join "")
+        let n_segs = ($segs_full | length)
+        [ $"($inputs)concat=n=($n_segs):v=1:a=0[($full_track_label)]" ]
+    }
+    let nodes_concat_pip = if ($segs_pip | is-empty) { [] } else {
+        let inputs = ($segs_pip | each { |s| $"[($s.label)]" } | str join "")
+        let n_segs = ($segs_pip | length)
+        [ $"($inputs)concat=n=($n_segs):v=1:a=0[($pip_track_label)]" ]
+    }
+
+    # In non-synthetic mode the concat track lives at [img_track] / [img_pip_track]
+    # and is overlaid onto the real screen base. In synthetic mode the concat
+    # track *is* [scr] / [scr_pip] (full_track_label == "scr"), so no overlay.
+    let nodes_full_overlay = if $has_full_imgs and (not $screen_synthetic) {
+        [ $"[($scr_base_label)][($full_track_label)]overlay=0:0:eof_action=pass[scr]" ]
+    } else { [] }
+    let nodes_pip_overlay = if $has_pip_imgs and (not $screen_synthetic) {
+        [ $"[($scr_pip_base_label)][($pip_track_label)]overlay=0:0:eof_action=pass[scr_pip]" ]
+    } else { [] }
 
     let overlay_base = $"[scr][cam_pip]overlay=x='($screen_primary_x)':y='($screen_primary_y)':eof_action=pass[v1]"
 
@@ -444,10 +607,16 @@ export def build-graph [
         $nodes_common
         ++ $nodes_cam
         ++ $nodes_scr_pip
-        ++ $nodes_img_full
-        ++ $nodes_img_pip
-        ++ $nodes_scr_fold
-        ++ $nodes_scr_pip_fold
+        ++ $nodes_img_clip_full
+        ++ $nodes_img_clip_pip
+        ++ $nodes_xfade_full
+        ++ $nodes_xfade_pip
+        ++ $nodes_gaps_full
+        ++ $nodes_gaps_pip
+        ++ $nodes_concat_full
+        ++ $nodes_concat_pip
+        ++ $nodes_full_overlay
+        ++ $nodes_pip_overlay
         ++ $overlays
         | str join ";"
     )

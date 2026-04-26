@@ -146,31 +146,52 @@ def main [cue_path: string] {
 
     let normalized = (normalize-cues $cues $speaker_dur)
 
-    # Image cues feed the graph as additional inputs at indices 2..(2+M-1),
-    # preserving cue order so filter-complex's input_idx math lines up. Each
-    # input is bounded to its cue's window: the per-image prep chain (scale,
-    # zscale colorspace, fade) only runs on frames that will actually appear,
-    # not the entire body duration. filter-complex pads the resulting stream
-    # back out to body length with cheap transparent frames via tpad.
+    # Image cues feed the graph as additional inputs. Input layout:
+    #   non-synthetic: [0]=screen, [1]=speaker, [2..]=images
+    #   synthetic:     [0]=speaker, [1..]=images   (lavfi black is gone —
+    #                  the concat'd image track in filter-complex is the
+    #                  full-body canvas in synthetic mode)
+    # Within filter-complex, contiguous same-routing image cues xfade
+    # into each other as a single concat segment. xfade consumes
+    # `transition` seconds from the front of every clip after the first
+    # in a run, so those clips need their input duration bumped by
+    # `transition` to keep the run's timeline math intact. The lead_in
+    # test below MUST stay aligned with the one in filter-complex.nu's
+    # image_entries — they together drive the xfade offset arithmetic.
+    let transition = ($layout.transition_duration | into float)
+    let route_of = { |mode|
+        if $mode in ["screen-primary" "screen-only"] { "full" } else if $mode == "speaker-primary" { "pip" } else { null }
+    }
     let image_cues = ($normalized | where { ($in.image? | default null) != null })
     let m = ($image_cues | length)
-    let image_inputs = ($image_cues | each { |c|
-        let dur = (($c.to - $c.from) + 0.5)
-        ["-loop" "1" "-framerate" $fps_s "-t" ($dur | into string) "-i" $c.image]
+    let image_inputs = ($normalized | enumerate | each { |it|
+        let c = $it.item
+        if ($c.image? | default null) == null {
+            []
+        } else {
+            let routing = (do $route_of $c.mode)
+            let lead_in = if $it.index > 0 {
+                let p = ($normalized | get ($it.index - 1))
+                let p_image = ($p.image? | default null)
+                let p_routing = (do $route_of $p.mode)
+                ($p_image != null) and ($p_routing == $routing) and ($p.to == $c.from)
+            } else { false }
+            let cue_dur = ($c.to - $c.from)
+            let dur = $cue_dur + (if $lead_in { $transition } else { 0.0 })
+            ["-loop" "1" "-framerate" $fps_s "-t" ($dur | into string) "-i" $c.image]
+        }
     } | flatten)
 
     let g = (build-graph $normalized $layout $speaker_dur $screen_synthetic)
 
-    let screen_input_args = if $screen_synthetic {
-        ["-f" "lavfi" "-i" $"color=c=black:s=($w)x($h):d=($speaker_dur_s):r=($fps)"]
-    } else {
-        [...$screen_pre "-i" $screen]
-    }
+    let screen_input_args = if $screen_synthetic { [] } else { [...$screen_pre "-i" $screen] }
+    let speaker_idx = (if $screen_synthetic { 0 } else { 1 })
+    let audio_base = ((if $screen_synthetic { 1 } else { 2 }) + $m)
 
     let audio_plan = if $audio_override != null {
         { kind: "file", path: $audio_override }
     } else if (has-audio-stream $speaker) {
-        { kind: "stream", map: "1:a:0" }
+        { kind: "stream", map: $"($speaker_idx):a:0" }
     } else if (not $screen_synthetic) and (has-audio-stream $screen) {
         print "speaker has no audio; falling back to screen audio"
         { kind: "stream", map: "0:a:0" }
@@ -178,7 +199,7 @@ def main [cue_path: string] {
         print "no audio available; using silence"
         { kind: "silence" }
     }
-    let audio = (build-audio $audio_plan (2 + $m))
+    let audio = (build-audio $audio_plan $audio_base)
 
     let args = [
         "-y"
